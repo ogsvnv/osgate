@@ -1,0 +1,28 @@
+name: Release 1.0.0
+on:
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  publish-release:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create immutable version tag and release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          if gh release view v1.0.0 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v1.0.0 already exists"
+            exit 0
+          fi
+          gh release create v1.0.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$RELEASE_SHA" \
+            --title "OSGate 1.0.0" \
+            --notes "OSGate 1.0.0: authenticated SOCKS5 over SSH with admin management, monitoring, session revocation, migrations, Docker and systemd support. Real OpenSSH E2E on park passed. Multi-host failover and load tests are explicitly excluded from this release's acceptance scope."
