@@ -14,6 +14,7 @@ from sqlalchemy import select, desc
 from .database import Admin, Client, SSHServer, Routing, Event, Audit, hasher
 from .routing import MODES
 from .ssh import connect_ssh
+from .dashboard_charts import DASHBOARD_CHARTS_HTML, DASHBOARD_CHARTS_CSS, DASHBOARD_CHARTS_JS
 from .hostkey_trust import HostKeyError, preview_host_key, verify_and_stage
 
 TEMPLATE = Environment(loader=BaseLoader(), autoescape=select_autoescape(default=True)).from_string('''
@@ -158,6 +159,8 @@ def register_routes(app, runtime):
                  ('Uptime, сек', uptime),
                  ('Последний failover', socks.router.last_failover or '—')]
         body = '<div class="grid">' + ''.join(f'<div class="card"><small>{safe(k)}</small><h2>{safe(v)}</h2></div>' for k, v in items) + '</div>'
+        body += '<style>' + DASHBOARD_CHARTS_CSS + '</style>' + DASHBOARD_CHARTS_HTML
+        body += '<script>' + DASHBOARD_CHARTS_JS + '</script>'
         body += '<section><h2>Состояние SSH</h2><table id="ssh-status-table"><tr><th>Имя</th><th>Состояние</th><th>Каналы</th><th>Задержка</th></tr>'
         for s in servers:
             body += f'<tr><td>{safe(s["name"])}</td><td class="status {safe(s["status"])}">{safe(s["status"])}</td><td>{s["active_channels"]}</td><td>{safe(s["latency_ms"])} мс</td></tr>'
@@ -167,6 +170,7 @@ async function updateDashboard(){try{
  const [a,b]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/metrics',{cache:'no-store'})]);
  if(!a.ok||!b.ok)return;
  const s=await a.json(),m=await b.json();
+ renderDashboardTraffic(m);renderDashboardLatency(s);
  const values=[s.ssh_servers.some(x=>x.ready)?'ONLINE':'NO SSH',s.socks_running?'RUNNING':'STOPPED',
  s.ssh_servers.filter(x=>x.ready).length+' / '+s.ssh_servers.length,
  s.active_connections,s.completed_connections,s.rejected_connections,s.active_clients,
@@ -178,7 +182,7 @@ async function updateDashboard(){try{
  cells[1].textContent=x.status;cells[1].className='status '+x.status;
  cells[2].textContent=x.active_channels;cells[3].textContent=x.latency_ms??'—';});
 }catch(_){}}
-setInterval(updateDashboard,5000);
+updateDashboard();setInterval(updateDashboard,5000);
 </script>"""
         return page(request, 'Панель управления', body)
 
