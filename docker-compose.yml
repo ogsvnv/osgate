@@ -1,0 +1,25 @@
+services:
+  osgate:
+    build: .
+    image: ghcr.io/ogsvnv/osgate:latest
+    container_name: osgate
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5812:5812"
+      - "127.0.0.1:1080:1080"
+    volumes:
+      - ./data:/data
+      - ./ssh:/ssh:ro
+    env_file: .env
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m
+    healthcheck:
+      test: ["CMD", "python", "-m", "osgate.healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
