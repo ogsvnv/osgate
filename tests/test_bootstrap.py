@@ -19,11 +19,12 @@ def test_bootstrap_shellcheck_and_help():
     assert "curl -fsSL" in result.stdout
     assert "--mode docker|systemd" in result.stdout
     assert "--update" in result.stdout
+    assert "--access" in result.stdout
 
 
 @pytest.mark.parametrize("args", [
     ["--mode", "invalid"], ["--dir"], ["--mode"],
-    ["--check", "--update"], ["--unknown"],
+    ["--check", "--update"], ["--access", "--check"], ["--unknown"],
 ])
 def test_bootstrap_rejects_bad_arguments(args):
     result = subprocess.run(["bash", str(SCRIPT), *args],

@@ -96,7 +96,7 @@ def test_refuse_noninteractive_install():
 def test_compose_ports_are_localhost_only_and_configurable():
     content = (ROOT / "docker-compose.yml").read_text()
     assert "127.0.0.1:${OSGATE_HOST_WEB_PORT:-5812}:5812" in content
-    assert "127.0.0.1:${OSGATE_HOST_SOCKS_PORT:-1080}:1080" in content
+    assert "${OSGATE_HOST_SOCKS_BIND:-127.0.0.1}:${OSGATE_HOST_SOCKS_PORT:-1080}:1080" in content
     assert "restart: unless-stopped" in content
 
 
@@ -108,7 +108,8 @@ def test_mocked_docker_wizard_creates_env_without_remote_changes(tmp_path, monke
     monkeypatch.setattr(wizard, "ROOT", tmp_path)
     monkeypatch.setattr(wizard, "require_root", lambda: None)
     monkeypatch.setattr(wizard, "docker_preflight", lambda: None)
-    monkeypatch.setattr(wizard, "unused_local_port", lambda port: None)
+    monkeypatch.setattr(wizard, "check_bind_port", lambda *args: None)
+    monkeypatch.setattr(wizard, "select_socks_access", lambda: "127.0.0.1")
     monkeypatch.setattr(wizard.os, "chown", lambda *args, **kwargs: None)
     answers = iter(["admin", "15812", "11080"])
     monkeypatch.setattr(wizard, "ask", lambda *args, **kwargs: next(answers))
@@ -121,6 +122,7 @@ def test_mocked_docker_wizard_creates_env_without_remote_changes(tmp_path, monke
     env = (tmp_path / ".env").read_text()
     assert "OSGATE_HOST_WEB_PORT=15812" in env
     assert "OSGATE_HOST_SOCKS_PORT=11080" in env
+    assert "OSGATE_HOST_SOCKS_BIND=127.0.0.1" in env
     assert "SESSION_SECRET=REPLACE_WITH" not in env
     assert (tmp_path / ".env").stat().st_mode & 0o777 == 0o600
     assert ("build",) in calls
@@ -157,3 +159,156 @@ def test_pull_source_requires_checkout_and_uses_checkout_owner(tmp_path, monkeyp
     wizard.pull_source()
     assert called == [("runuser", "-u", "developer", "--", "git", "-C",
                        str(tmp_path), "pull", "--ff-only")]
+
+
+
+def test_socks_ipv4_interface_validation(monkeypatch):
+    monkeypatch.setattr(wizard, "interface_addresses",
+                        lambda: {"127.0.0.1", "0.0.0.0", "192.168.10.24"})
+    assert wizard.validate_socks_bind("192.168.10.24") == "192.168.10.24"
+    assert wizard.validate_socks_bind("0.0.0.0") == "0.0.0.0"
+    for value in ("300.1.1.1", "hostname", "10.1.2.3"):
+        with pytest.raises(wizard.InstallError):
+            wizard.validate_socks_bind(value)
+    with pytest.raises(wizard.InstallError):
+        wizard.bind_address("::")
+
+
+def test_select_access_modes_and_explicit_confirmation(monkeypatch):
+    monkeypatch.setattr(wizard, "interface_addresses",
+                        lambda: {"127.0.0.1", "0.0.0.0", "10.20.30.40"})
+    monkeypatch.setattr(wizard, "ask", lambda *args: "1")
+    assert wizard.select_socks_access() == "127.0.0.1"
+    monkeypatch.setattr(wizard, "ask", lambda *args: "2")
+    monkeypatch.setattr(wizard, "yesno", lambda *args, **kwargs: False)
+    with pytest.raises(wizard.InstallError):
+        wizard.select_socks_access()
+    monkeypatch.setattr(wizard, "yesno", lambda *args, **kwargs: True)
+    assert wizard.select_socks_access() == "0.0.0.0"
+    answers = iter(["3", "10.20.30.40"])
+    monkeypatch.setattr(wizard, "ask", lambda *args: next(answers))
+    assert wizard.select_socks_access() == "10.20.30.40"
+
+
+def test_docker_install_public_option_never_exposes_admin(tmp_path, monkeypatch):
+    import shutil
+    shutil.copy2(ROOT / ".env.example", tmp_path / ".env.example")
+    shutil.copy2(ROOT / "docker-compose.yml", tmp_path / "docker-compose.yml")
+    monkeypatch.setattr(wizard, "ROOT", tmp_path)
+    monkeypatch.setattr(wizard, "require_root", lambda: None)
+    monkeypatch.setattr(wizard, "docker_preflight", lambda: None)
+    monkeypatch.setattr(wizard, "check_bind_port", lambda *args: None)
+    monkeypatch.setattr(wizard, "select_socks_access", lambda: "0.0.0.0")
+    monkeypatch.setattr(wizard.os, "chown", lambda *args, **kwargs: None)
+    answers = iter(["admin", "15812", "11080"])
+    monkeypatch.setattr(wizard, "ask", lambda *args, **kwargs: next(answers))
+    monkeypatch.setattr(wizard, "yesno", lambda *args, **kwargs: False)
+    calls = []
+    monkeypatch.setattr(wizard, "docker", lambda *args: calls.append(args))
+    monkeypatch.setattr(wizard, "check_health", lambda port: port == 15812)
+    wizard.docker_install()
+    env = (tmp_path / ".env").read_text()
+    assert "OSGATE_HOST_SOCKS_BIND=0.0.0.0" in env
+    assert "WEB_ALLOWED_CIDRS=127.0.0.1/32,::1/128" in env
+    assert "SESSION_SECRET=REPLACE" not in env
+
+
+def test_docker_access_change_keeps_env_and_restarts(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text(
+        "SESSION_SECRET=old-value\nOSGATE_HOST_SOCKS_BIND=127.0.0.1\n"
+        "OSGATE_HOST_WEB_PORT=5812\n")
+    monkeypatch.setattr(wizard, "ROOT", tmp_path)
+    monkeypatch.setattr(wizard, "require_root", lambda: None)
+    monkeypatch.setattr(wizard, "docker_preflight", lambda: None)
+    monkeypatch.setattr(wizard, "select_socks_access", lambda: "0.0.0.0")
+    monkeypatch.setattr(wizard, "yesno", lambda *args, **kwargs: True)
+    calls = []
+    monkeypatch.setattr(wizard, "docker", lambda *args: calls.append(args))
+    wizard.configure_access("docker")
+    new_env = (tmp_path / ".env").read_text()
+    assert "SESSION_SECRET=old-value" in new_env
+    assert "OSGATE_HOST_WEB_PORT=5812" in new_env
+    assert "OSGATE_HOST_SOCKS_BIND=0.0.0.0" in new_env
+    assert ("up", "-d", "--no-build") in calls
+    assert len(list((tmp_path / "backups").glob("osgate-env-*"))) == 1
+
+
+def test_docker_access_change_rolls_back_if_recreate_fails(tmp_path, monkeypatch):
+    (tmp_path / ".env").write_text(
+        "OSGATE_HOST_SOCKS_BIND=127.0.0.1\nSESSION_SECRET=unchanged\n")
+    monkeypatch.setattr(wizard, "ROOT", tmp_path)
+    monkeypatch.setattr(wizard, "require_root", lambda: None)
+    monkeypatch.setattr(wizard, "docker_preflight", lambda: None)
+    monkeypatch.setattr(wizard, "select_socks_access", lambda: "0.0.0.0")
+    monkeypatch.setattr(wizard, "yesno", lambda *args, **kwargs: True)
+    attempts = []
+    def fake_docker(*args):
+        attempts.append(args)
+        if args == ("up", "-d", "--no-build") and attempts.count(args) == 1:
+            raise wizard.InstallError("broken Docker")
+    monkeypatch.setattr(wizard, "docker", fake_docker)
+    with pytest.raises(wizard.InstallError):
+        wizard.configure_access("docker")
+    assert "OSGATE_HOST_SOCKS_BIND=127.0.0.1" in (tmp_path / ".env").read_text()
+    assert attempts.count(("up", "-d", "--no-build")) == 2
+
+
+
+def test_mocked_systemd_install_honors_external_socks_binding(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(wizard, "ROOT", tmp_path / "repo")
+    monkeypatch.setattr(wizard, "SYSTEM_ROOT", tmp_path / "opt" / "osgate")
+    monkeypatch.setattr(wizard, "SYSTEM_ENV", tmp_path / "etc" / "osgate.env")
+    monkeypatch.setattr(wizard, "SYSTEM_SSH", tmp_path / "etc" / "ssh")
+    monkeypatch.setattr(wizard, "require_root", lambda: None)
+    monkeypatch.setattr(wizard, "systemd_preflight", lambda: None)
+    monkeypatch.setattr(wizard, "check_bind_port", lambda *args: None)
+    monkeypatch.setattr(wizard, "select_socks_access", lambda: "0.0.0.0")
+    monkeypatch.setattr(wizard, "copy_source", lambda p: p.mkdir(parents=True))
+    monkeypatch.setattr(wizard.shutil, "chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(wizard.os, "chmod", lambda *args: None)
+    monkeypatch.setattr(wizard.pwd, "getpwnam",
+                        lambda u: SimpleNamespace(pw_uid=11001, pw_gid=11001))
+    monkeypatch.setattr(wizard, "ssh_setup", lambda *args: None)
+    monkeypatch.setattr(wizard, "system_command", lambda *args: None)
+    monkeypatch.setattr(wizard, "check_health", lambda port: port == 15812)
+    answers = iter(["admin", "15812", "11080"])
+    monkeypatch.setattr(wizard, "ask", lambda *args: next(answers))
+    monkeypatch.setattr(wizard, "yesno", lambda *args, **kwargs: True)
+    calls = []
+    def fake_run(*args, **kwargs):
+        calls.append(args)
+        if args[:1] == ("bash",):
+            wizard.SYSTEM_ENV.parent.mkdir(parents=True, exist_ok=True)
+            wizard.SYSTEM_ENV.write_text(
+                "SESSION_SECRET=kept\nWEB_HOST=127.0.0.1\n"
+                "SOCKS_HOST=127.0.0.1\n"
+            )
+    monkeypatch.setattr(wizard, "run", fake_run)
+    wizard.systemd_install()
+    env = wizard.SYSTEM_ENV.read_text()
+    assert "SOCKS_HOST=0.0.0.0" in env
+    assert "WEB_HOST=127.0.0.1" in env
+    assert "SESSION_SECRET=kept" in env
+    assert ("systemctl", "enable", "--now", "osgate") in calls
+
+
+def test_systemd_access_change_keeps_config_and_restarts(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(wizard, "ROOT", tmp_path)
+    conf = tmp_path / "systemd.env"
+    conf.write_text("SESSION_SECRET=old-secret\nSOCKS_HOST=127.0.0.1\nWEB_HOST=127.0.0.1\n")
+    monkeypatch.setattr(wizard, "SYSTEM_ENV", conf)
+    monkeypatch.setattr(wizard, "require_root", lambda: None)
+    monkeypatch.setattr(wizard, "select_socks_access", lambda: "192.168.1.10")
+    monkeypatch.setattr(wizard, "yesno", lambda *args, **kwargs: True)
+    monkeypatch.setattr(wizard.shutil, "chown", lambda *args, **kwargs: None)
+    monkeypatch.setattr(wizard.os, "chmod", lambda *args: None)
+    commands = []
+    monkeypatch.setattr(wizard, "run", lambda *args: commands.append(args))
+    wizard.configure_access("systemd")
+    assert "SOCKS_HOST=192.168.1.10" in conf.read_text()
+    assert "WEB_HOST=127.0.0.1" in conf.read_text()
+    assert "SESSION_SECRET=old-secret" in conf.read_text()
+    assert commands == [("systemctl", "restart", "osgate")]
+    assert list((tmp_path / "backups").glob("osgate-systemd-env-*"))

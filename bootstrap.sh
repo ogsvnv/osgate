@@ -19,6 +19,7 @@ OSGate — установка на новую машину
   --dir PATH              Каталог для исходников (по умолчанию ~/osgate)
   --check                 Проверить ранее установленный OSGate
   --update                Обновить ранее установленный OSGate
+  --access                Изменить доступ к SOCKS5 без переустановки
   -h, --help              Показать справку
 
 Для установки необходимы: Linux, bash, git, python3, curl или wget
@@ -46,6 +47,9 @@ while (($#)); do
     --update)
       [[ "$ACTION" == install ]] || fail "Выберите только одно действие"
       ACTION='update'; shift;;
+    --access)
+      [[ "$ACTION" == install ]] || fail "Выберите только одно действие"
+      ACTION='access'; shift;;
     --help|-h)
       usage; exit 0;;
     *) fail "Неизвестный параметр: $1";;
@@ -101,6 +105,7 @@ args=()
 case "$ACTION" in
   check) args+=(--check);;
   update) args+=(--update);;
+  access) args+=(--access);;
 esac
 
 say "Запуск мастера OSGate. Пароли будут вводиться через терминал."
