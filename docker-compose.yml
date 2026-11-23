@@ -5,8 +5,8 @@ services:
     container_name: osgate
     restart: unless-stopped
     ports:
-      - "127.0.0.1:5812:5812"
-      - "127.0.0.1:1080:1080"
+      - "127.0.0.1:${OSGATE_HOST_WEB_PORT:-5812}:5812"
+      - "127.0.0.1:${OSGATE_HOST_SOCKS_PORT:-1080}:1080"
     volumes:
       - ./data:/data
       - ./ssh:/ssh:ro
