@@ -431,8 +431,23 @@ updateDashboard();setInterval(updateDashboard,5000);
         settings = await asyncio.to_thread(db.routing)
         body = f'<section><form method="post" action="/routing">{control(request)}'
         body += '<label>Режим <select name="mode">'
+        labels = {
+            'failover': 'Резервирование (по приоритету)',
+            'round_robin': 'По очереди (Round Robin)',
+            'weighted_round_robin': 'По весам (Weighted Round Robin)',
+            'manual': 'Вручную',
+            'sticky': 'Закрепление за клиентом (Sticky)',
+            'min_rtt': 'Минимальная задержка (RTT)',
+        }
         for m in sorted(MODES):
-            body += f'<option value="{m}" {"selected" if m == settings["mode"] else ""}>{m}</option>'
+            body += (f'<option value="{m}" '
+                     f'{"selected" if m == settings["mode"] else ""}>'
+                     f'{safe(labels[m])}</option>')
+        body += ('<p class="muted">Минимальная задержка (RTT): новые SOCKS5-'
+                 'соединения идут через доступный сервер с наименьшим '
+                 'временем TCP-проверки через SSH. При отказе пробуется '
+                 'следующий сервер; существующие соединения не переносятся. '
+                 'Привязка клиента к SSH-серверу имеет приоритет.</p>')
         body += '</select></label>' + esc_input('manual_server_id', settings['manual_server_id'] or '', 'number')
         body += '<label><input type="checkbox" name="auto_failback" value="yes"' + (' checked' if settings['auto_failback'] else '') + '>Автовозврат основного сервера</label><button>Применить</button></form></section>'
         return page(request, 'Маршрутизация', body)
