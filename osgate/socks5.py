@@ -55,12 +55,13 @@ class Tunnel:
 
 
 class SocksServer:
-    def __init__(self, db, ssh, settings):
+    def __init__(self, db, ssh, settings, notify=None):
         self.db = db
         self.ssh = ssh
         self.settings = settings
         self.router = Router()
-        self.route_tracker = RouteHistoryTracker(db)
+        self._notify_route = notify
+        self.route_tracker = RouteHistoryTracker(db, on_change=self._route_changed)
         self.server = None
         self.active: dict[int, Tunnel] = {}
         self._handlers: set[asyncio.Task] = set()
@@ -69,6 +70,21 @@ class SocksServer:
         self._sequence = 0
         self.rejected = 0
         self.completed = 0
+
+    def _route_changed(self, reason, previous_id, selected_id, details):
+        if not self._notify_route:
+            return
+        kind = {
+            'offline': 'route_failover',
+            'forwarding_failed': 'route_failover',
+            'recovered': 'route_recovered',
+            'lower_rtt': 'route_rtt',
+            'manual': 'route_manual',
+        }.get(reason)
+        if kind:
+            message = (f'SSH-маршрут: ID {previous_id} → ID {selected_id} '
+                       f'({reason})')
+            asyncio.create_task(self._notify_route(kind, message))
 
     async def start(self):
         self.server = await asyncio.start_server(self._handle, self.settings.socks_host,

@@ -21,7 +21,7 @@ class Runtime:
         self.db = db or Database(settings.database_url)
         self.notifier = Notifier(settings)
         self.ssh = SSHManager(self.db, settings, notify=self.notifier.notify, connector=connector)
-        self.socks = SocksServer(self.db, self.ssh, settings)
+        self.socks = SocksServer(self.db, self.ssh, settings, notify=self.notifier.notify_event)
         self._metrics_task = None
         self.started_at = time.monotonic()
 
@@ -29,6 +29,7 @@ class Runtime:
         await asyncio.to_thread(self.db.initialize)
         from .settings_store import load_runtime_settings
         await asyncio.to_thread(load_runtime_settings, self.db, self.settings)
+        await asyncio.to_thread(self.notifier.load, self.db)
         await self.ssh.start()
         try:
             await self.socks.start()

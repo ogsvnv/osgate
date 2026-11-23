@@ -11,8 +11,9 @@ log = logging.getLogger(__name__)
 
 
 class RouteHistoryTracker:
-    def __init__(self, db):
+    def __init__(self, db, on_change=None):
         self.db = db
+        self.on_change = on_change
         self._last_id: int | None = None
         self._last_mode: str | None = None
         self._pending_id: int | None = None
@@ -76,6 +77,11 @@ class RouteHistoryTracker:
                 reason=reason, mode=mode, actor='system', details=details)
         except Exception:
             log.warning('Route event could not be persisted')
+        if self.on_change:
+            try:
+                self.on_change(reason, self._last_id, selected, details)
+            except Exception:
+                log.warning('Route notification dispatch failed')
         self._last_id = selected
         self._pending_id = None
         self._pending_count = 0

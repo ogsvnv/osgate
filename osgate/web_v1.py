@@ -319,6 +319,8 @@ def register_v1_routes(app, runtime):
                 actor=request.session['admin'],
                 details={'old_mode': 'failover', 'new_mode': 'failover'})
             socks.route_tracker.reset()
+            await runtime.notifier.notify_event(
+                'route_manual', f'Основной SSH-сервер: ID {previous_id} → ID {server_id}')
         await asyncio.to_thread(db.audit, request.session['admin'], 'server_primary', str(server_id))
         return return_to('/servers')
 

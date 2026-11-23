@@ -225,6 +225,20 @@ class Database:
             else:
                 obj.value = value
 
+    def set_settings(self, values: dict[str, str]):
+        # Store related Telegram configuration fields atomically.
+        if not values or len(values) > 20:
+            raise ValueError('Invalid settings')
+        with self.session() as session:
+            for key, value in values.items():
+                if len(key) > 120 or len(value) > 500:
+                    raise ValueError('Setting too long')
+                setting = session.get(ApplicationSetting, key)
+                if setting is None:
+                    session.add(ApplicationSetting(key=key, value=value))
+                else:
+                    setting.value = value
+
     def auth_generation(self):
         return self.get_setting('admin_auth_generation', '0')
 
@@ -300,6 +314,37 @@ class Database:
                  'time': (row.when if row.when.tzinfo else
                           row.when.replace(tzinfo=timezone.utc)).isoformat(),
                  'latency_ms': row.latency_ms} for row in rows]
+
+    def ssh_latency_stats(self, *, now: datetime | None = None):
+        """Aggregate real TCP health probes in the last 10 minutes per SSH server."""
+        current = now or utcnow()
+        cutoff = current - timedelta(minutes=10)
+        with self.session() as session:
+            records = session.scalars(select(SSHLatencySample).where(
+                SSHLatencySample.when >= cutoff,
+                SSHLatencySample.when <= current
+            ).order_by(SSHLatencySample.when)).all()
+        data = {}
+        for item in records:
+            row = data.setdefault(item.server_id, {
+                'checks': 0, 'success': 0, 'failures': 0,
+                'min_rtt_ms': None, 'avg_rtt_ms': None, 'max_rtt_ms': None,
+                'last_success': None, '_sum': 0.0})
+            row['checks'] += 1
+            if item.latency_ms is None:
+                row['failures'] += 1
+                continue
+            rtt = item.latency_ms
+            row['success'] += 1
+            row['_sum'] += rtt
+            row['min_rtt_ms'] = min(row['min_rtt_ms'], rtt) if row['min_rtt_ms'] is not None else rtt
+            row['max_rtt_ms'] = max(row['max_rtt_ms'], rtt) if row['max_rtt_ms'] is not None else rtt
+            row['last_success'] = (item.when if item.when.tzinfo else
+                                   item.when.replace(tzinfo=timezone.utc)).isoformat()
+        for row in data.values():
+            row['avg_rtt_ms'] = round(row.pop('_sum') / row['success'], 1) if row['success'] else None
+            row['success_rate_percent'] = round(100 * row['success'] / row['checks'], 1)
+        return data
 
     def record_route_event(self, *, from_server_id: int | None,
                            to_server_id: int | None, reason: str,
