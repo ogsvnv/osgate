@@ -86,7 +86,7 @@ def test_migration_revision_is_registered(setup):
     cfg, db=setup
     with db.engine.connect() as conn:
         revision=conn.exec_driver_sql('select version_num from alembic_version').scalar()
-        assert revision=='0003'
+        assert revision=='0004'
         assert db.engine.dialect.has_table(conn,'ssh_latency_samples')
 
 

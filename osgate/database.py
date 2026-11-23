@@ -1,6 +1,7 @@
 """SQLite models and small session-scoped repository methods."""
 from datetime import datetime, timezone, timedelta
 import secrets
+import json
 from pathlib import Path
 from contextlib import contextmanager
 from argon2 import PasswordHasher
@@ -86,6 +87,21 @@ class SSHLatencySample(Base):
     server_id: Mapped[int] = mapped_column(Integer, nullable=False)
     when: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class RouteEvent(Base):
+    __tablename__ = 'route_events'
+    __table_args__ = (Index('ix_route_events_when', 'when'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    when: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    from_server_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    to_server_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    from_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    to_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    reason: Mapped[str] = mapped_column(String(40))
+    mode: Mapped[str] = mapped_column(String(40))
+    actor: Mapped[str] = mapped_column(String(120), default='system')
+    details: Mapped[str] = mapped_column(String(1000), default='{}')
 
 
 class Event(Base):
@@ -284,6 +300,91 @@ class Database:
                  'time': (row.when if row.when.tzinfo else
                           row.when.replace(tzinfo=timezone.utc)).isoformat(),
                  'latency_ms': row.latency_ms} for row in rows]
+
+    def record_route_event(self, *, from_server_id: int | None,
+                           to_server_id: int | None, reason: str,
+                           mode: str, actor: str = 'system',
+                           details: dict | None = None,
+                           when: datetime | None = None):
+        """Store one meaningful global route event with historical name snapshots."""
+        if reason not in ('offline', 'forwarding_failed', 'lower_rtt',
+                          'recovered', 'manual', 'mode_changed', 'route_changed'):
+            raise ValueError('Unknown route event reason')
+        if mode not in ('failover', 'min_rtt', 'manual', 'round_robin',
+                        'weighted_round_robin', 'sticky'):
+            raise ValueError('Unknown routing mode')
+        stamp = when or utcnow()
+        if stamp.tzinfo is None:
+            raise ValueError('Timezone-aware datetime required')
+        details_json = json.dumps(details or {}, ensure_ascii=False, allow_nan=False)
+        if len(details_json) > 950:
+            raise ValueError('Route event details too long')
+        with self.session() as session:
+            servers = {x.id: x.name for x in session.scalars(
+                select(SSHServer).where(SSHServer.id.in_(
+                    [sid for sid in (from_server_id, to_server_id)
+                     if sid is not None])))}
+            session.add(RouteEvent(
+                when=stamp, from_server_id=from_server_id,
+                to_server_id=to_server_id,
+                from_name=servers.get(from_server_id),
+                to_name=servers.get(to_server_id),
+                reason=reason, mode=mode, actor=actor[:120],
+                details=details_json))
+            session.query(RouteEvent).filter(
+                RouteEvent.when < stamp - timedelta(days=7)
+            ).delete(synchronize_session=False)
+
+    def purge_route_events(self):
+        with self.session() as session:
+            session.query(RouteEvent).filter(
+                RouteEvent.when < utcnow() - timedelta(days=7)
+            ).delete(synchronize_session=False)
+
+    def recent_route_events(self, *, hours: int = 24,
+                            server_id: int | None = None,
+                            reason: str | None = None,
+                            offset: int = 0, limit: int = 50,
+                            now: datetime | None = None):
+        if hours not in (1, 24, 168) or offset < 0 or not 1 <= limit <= 10000:
+            raise ValueError('Invalid route history range')
+        if offset > 1000000:
+            raise ValueError('Invalid offset')
+        cutoff = (now or utcnow()) - timedelta(hours=hours)
+        conditions = [RouteEvent.when >= cutoff]
+        if server_id is not None:
+            conditions.append((RouteEvent.from_server_id == server_id) |
+                              (RouteEvent.to_server_id == server_id))
+        if reason:
+            conditions.append(RouteEvent.reason == reason)
+        with self.session() as session:
+            count = session.scalar(select(func.count(RouteEvent.id)).where(*conditions))
+            records = session.scalars(select(RouteEvent).where(*conditions)
+                .order_by(RouteEvent.when.desc(), RouteEvent.id.desc())
+                .offset(offset).limit(limit)).all()
+        rows = [
+            {'id': item.id,
+             'time': (item.when if item.when.tzinfo else item.when.replace(
+                 tzinfo=timezone.utc)).isoformat(),
+             'from_server_id': item.from_server_id,
+             'to_server_id': item.to_server_id,
+             'from_name': item.from_name, 'to_name': item.to_name,
+             'reason': item.reason, 'mode': item.mode, 'actor': item.actor,
+             'details': json.loads(item.details or '{}')}
+            for item in records]
+        return {'total': int(count or 0), 'events': rows}
+
+    def route_event_stats(self, *, now: datetime | None = None):
+        cutoff = (now or utcnow()) - timedelta(hours=24)
+        with self.session() as session:
+            rows = list(session.scalars(
+                select(RouteEvent).where(RouteEvent.when >= cutoff)))
+        return {
+            'total': len(rows),
+            'emergency': sum(row.reason in ('offline', 'forwarding_failed') for row in rows),
+            'recovery': sum(row.reason == 'recovered' for row in rows),
+            'last': max((row.when for row in rows), default=None),
+        }
 
     def event(self, category: str, message: str):
         with self.session() as s:

@@ -303,10 +303,22 @@ def register_v1_routes(app, runtime):
             item = session.get(SSHServer, server_id)
             if not item:
                 raise HTTPException(404)
-            for i, other in enumerate(session.scalars(select(SSHServer).order_by(SSHServer.priority, SSHServer.id))):
+            ordered = list(session.scalars(
+                select(SSHServer).order_by(SSHServer.priority, SSHServer.id)))
+            previous_id = ordered[0].id if ordered else None
+            for i, other in enumerate(ordered):
                 other.priority = i + 2
             item.priority = 1
         await ssh.refresh()
+        route_settings = await asyncio.to_thread(db.routing)
+        if previous_id != server_id and route_settings['mode'] == 'failover':
+            await asyncio.to_thread(
+                db.record_route_event,
+                from_server_id=previous_id, to_server_id=server_id,
+                reason='manual', mode='failover',
+                actor=request.session['admin'],
+                details={'old_mode': 'failover', 'new_mode': 'failover'})
+            socks.route_tracker.reset()
         await asyncio.to_thread(db.audit, request.session['admin'], 'server_primary', str(server_id))
         return return_to('/servers')
 

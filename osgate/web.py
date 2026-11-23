@@ -2,7 +2,7 @@
 import asyncio
 import ipaddress
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from urllib.parse import parse_qs
 
@@ -25,7 +25,7 @@ TEMPLATE = Environment(loader=BaseLoader(), autoescape=select_autoescape(default
 @media(prefers-color-scheme:light){:root{color-scheme:light;--bg:#f6f7fa;--panel:white;--line:#d8deea;--fg:#182034;--soft:#525d76;--accent:#3455c5;--red:#b11;--green:#18794e}}
 *{box-sizing:border-box}body{background:var(--bg);color:var(--fg);font:15px system-ui,sans-serif;margin:0}header{display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:14px 22px;background:var(--panel);border-bottom:1px solid var(--line)}header strong{font-size:20px;margin-right:12px}nav{display:flex;flex-wrap:wrap;gap:8px}a{color:var(--accent);text-decoration:none}nav a{padding:7px 10px;border-radius:6px}nav a:hover{background:var(--bg)}main{max-width:1280px;margin:24px auto;padding:0 16px}h1{font-size:26px}h2{font-size:18px}section,.card{padding:18px;margin:16px 0;border:1px solid var(--line);border-radius:12px;background:var(--panel)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px}.grid .card{margin:0}small,.muted{color:var(--soft)}table{width:100%;border-collapse:collapse;text-align:left;font-size:14px}td,th{padding:10px;border-bottom:1px solid var(--line);vertical-align:top}table{display:block;overflow-x:auto}input,select,button{background:var(--bg);color:var(--fg);padding:9px;border:1px solid var(--line);border-radius:6px;margin:3px;max-width:100%}button{background:var(--accent);color:white;border:0;cursor:pointer}button.danger{background:var(--red);color:#141414}.status{font-weight:700}.ONLINE{color:var(--green)}.OFFLINE{color:var(--red)}.DEGRADED,.CONNECTING,.RECONNECTING{color:#daa032}.inline{display:inline}.notice{color:var(--red)}label{display:inline-block;margin:5px 8px 5px 0}.stack label{display:block}form{margin:8px 0}input[type=number]{width:95px}input[type=checkbox]{width:auto}code{color:var(--accent)}
 </style></head><body><header><strong>◈ OSGate</strong>{% if logged_in %}<nav>
-<a href="/">Обзор</a><a href="/servers">SSH-серверы</a><a href="/clients">Клиенты</a><a href="/routing">Маршрутизация</a><a href="/connections">Соединения</a><a href="/logs">Журнал</a><a href="/settings">Настройки</a></nav><form method="post" action="/logout" style="margin-left:auto"><input type="hidden" name="csrf" value="{{ csrf }}"><button>Выход</button></form>{% endif %}</header>
+<a href="/">Обзор</a><a href="/servers">SSH-серверы</a><a href="/clients">Клиенты</a><a href="/routing">Маршрутизация</a><a href="/route-history">История маршрутов</a><a href="/connections">Соединения</a><a href="/logs">Журнал</a><a href="/settings">Настройки</a></nav><form method="post" action="/logout" style="margin-left:auto"><input type="hidden" name="csrf" value="{{ csrf }}"><button>Выход</button></form>{% endif %}</header>
 <main><h1>{{ title }}</h1>{% if error %}<p class="notice">{{ error }}</p>{% endif %}{{ body | safe }}</main></body></html>''')
 
 
@@ -157,10 +157,69 @@ def register_routes(app, runtime):
                  ('Отправлено, байт', up + sum(t.uploaded for t in socks.active.values())),
                  ('Получено, байт', down + sum(t.downloaded for t in socks.active.values())),
                  ('Uptime, сек', uptime),
-                 ('Последний failover', socks.router.last_failover or '—')]
+                 ('Последний failover', datetime.fromtimestamp(socks.router.last_failover, timezone.utc).strftime('%d.%m.%Y %H:%M:%S UTC') if socks.router.last_failover else '—')]
         body = '<div class="grid">' + ''.join(f'<div class="card"><small>{safe(k)}</small><h2>{safe(v)}</h2></div>' for k, v in items) + '</div>'
         body += '<style>' + DASHBOARD_CHARTS_CSS + '</style>' + DASHBOARD_CHARTS_HTML
         body += '<script>' + DASHBOARD_CHARTS_JS + '</script>'
+        from .route_history_ui import history_table
+        recent = await asyncio.to_thread(db.recent_route_events, limit=5)
+        body += ('<section><h2>🔄 История переключений маршрутов</h2>'
+                 '<p class="muted">Последние 5 событий · обновление каждые 5 секунд</p>')
+        body += history_table(recent['events'], dom_id='dashboard-route-events')
+        body += '<p><a href="/route-history">Вся история →</a></p></section>'
+        from .route_history_ui import time_script
+        body += time_script()
+        body += '''<script>
+        let lastRoutePreview='';
+        async function refreshRoutePreview(){
+          try{
+            const response=await fetch('/api/route-events?limit=5',
+              {cache:'no-store'});
+            if(!response.ok)return;
+            const data=await response.json();
+            const signature=data.events.map(e=>e.id).join(',');
+            if(signature===lastRoutePreview)return;
+            lastRoutePreview=signature;
+            const body=document.querySelector('#dashboard-route-events tbody');
+            body.replaceChildren();
+            const labels={
+              offline:'🔴 SSH недоступен',
+              forwarding_failed:'🔴 Ошибка TCP forwarding',
+              recovered:'🟢 Восстановление',
+              lower_rtt:'🟡 Меньшая задержка RTT',
+              manual:'🔵 Ручной выбор',
+              mode_changed:'🔵 Режим изменён',
+              route_changed:'🔵 Маршрут изменён'};
+            const modes={failover:'Failover',min_rtt:'Минимальный RTT',
+              manual:'Ручной',round_robin:'Round Robin',
+              weighted_round_robin:'Weighted Round Robin',sticky:'Sticky'};
+            for(const event of data.events){
+              const tr=document.createElement('tr');
+              const when=document.createElement('td');
+              when.textContent=new Date(event.time).toLocaleString('ru-RU');
+              tr.appendChild(when);
+              for(const content of [
+                event.from_name|| (event.from_server_id? 'ID '+event.from_server_id:'—'),
+                event.to_name|| (event.to_server_id?'ID '+event.to_server_id:'—'),
+                labels[event.reason]||event.reason,
+                modes[event.mode]||event.mode]){
+                const td=document.createElement('td');td.textContent=content;
+                tr.appendChild(td);
+              }
+              const td=document.createElement('td');
+              const link=document.createElement('a');
+              link.href='/route-history';link.textContent='Подробности';
+              td.appendChild(link);tr.appendChild(td);body.appendChild(tr);
+            }
+            if(!data.events.length){
+              const row=document.createElement('tr'),col=document.createElement('td');
+              col.colSpan=6;col.textContent='Пока нет переключений';
+              row.appendChild(col);body.appendChild(row);
+            }
+          }catch(_){}
+        }
+        refreshRoutePreview();setInterval(refreshRoutePreview,5000);
+        </script>'''
         body += '<section><h2>Состояние SSH</h2><table id="ssh-status-table"><tr><th>Имя</th><th>Состояние</th><th>Каналы</th><th>Задержка</th></tr>'
         for s in servers:
             body += f'<tr><td>{safe(s["name"])}</td><td class="status {safe(s["status"])}">{safe(s["status"])}</td><td>{s["active_channels"]}</td><td>{safe(s["latency_ms"])} мс</td></tr>'
@@ -175,7 +234,7 @@ async function updateDashboard(){try{
  const values=[s.ssh_servers.some(x=>x.ready)?'ONLINE':'NO SSH',s.socks_running?'RUNNING':'STOPPED',
  s.ssh_servers.filter(x=>x.ready).length+' / '+s.ssh_servers.length,
  s.active_connections,s.completed_connections,s.rejected_connections,s.active_clients,
- m.uploaded,m.downloaded,s.uptime_seconds,s.last_failover||'—'];
+ m.uploaded,m.downloaded,s.uptime_seconds,s.last_failover?new Date(s.last_failover*1000).toLocaleString('ru-RU'):'—'];
  document.querySelectorAll('.grid .card h2').forEach((x,i)=>{if(i<values.length)x.textContent=values[i]});
  const rows=document.getElementById('ssh-status-table').querySelectorAll('tr');
  s.ssh_servers.forEach((x,i)=>{if(!rows[i+1])return;
@@ -467,6 +526,7 @@ updateDashboard();setInterval(updateDashboard,5000);
                 raise ValueError
         except ValueError as exc:
             raise HTTPException(400, 'Invalid failback delay') from exc
+        before = await asyncio.to_thread(db.routing)
         with db.session() as s:
             if data['mode'] == 'manual' and (not mid or not s.get(SSHServer, mid)):
                 raise HTTPException(400, 'Manual SSH server required')
@@ -475,6 +535,17 @@ updateDashboard();setInterval(updateDashboard,5000);
             route.manual_server_id = mid
             route.auto_failback = data.get('auto_failback') == 'yes'
         await asyncio.to_thread(db.set_setting, 'failback_delay', str(delay))
+        if (before['mode'] != data['mode']
+                or (data['mode'] == 'manual'
+                    and before['manual_server_id'] != mid)):
+            await asyncio.to_thread(
+                db.record_route_event,
+                from_server_id=before['manual_server_id'] if before['mode'] == 'manual' else None,
+                to_server_id=mid if data['mode'] == 'manual' else None,
+                reason='mode_changed', mode=data['mode'],
+                actor=request.session['admin'],
+                details={'old_mode': before['mode'], 'new_mode': data['mode']})
+            socks.route_tracker.reset()
         await asyncio.to_thread(db.audit, request.session['admin'], 'routing_change', data['mode'])
         return return_to('/routing')
 
@@ -546,3 +617,5 @@ updateDashboard();setInterval(updateDashboard,5000);
 
     from .web_v1 import register_v1_routes
     register_v1_routes(app, runtime)
+    from .route_history_ui import register_route_history_routes
+    register_route_history_routes(app, runtime)
