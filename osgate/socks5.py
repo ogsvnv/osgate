@@ -6,6 +6,7 @@ import struct
 import time
 from dataclasses import dataclass, field
 from .routing import Router
+from .route_history import RouteHistoryTracker
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +60,7 @@ class SocksServer:
         self.ssh = ssh
         self.settings = settings
         self.router = Router()
+        self.route_tracker = RouteHistoryTracker(db)
         self.server = None
         self.active: dict[int, Tunnel] = {}
         self._handlers: set[asyncio.Task] = set()
@@ -203,6 +205,11 @@ class SocksServer:
                                 port=port, ssh_server_id=selected_id,
                                 task=asyncio.current_task())
                 self.active[tunnel.id] = tunnel
+                if client.get('pinned_server_id') is None:
+                    self.route_tracker.observe(
+                        mode=settings['mode'], selected=selected_id,
+                        available=self.ssh.candidates(),
+                        preferred_id=candidates[0]['id'] if candidates else None)
                 writer.write(reply(0)); await writer.drain()
             # Both halves run independently, allowing TCP half-closure.
             await self._relay(reader, writer, channel_reader, channel_writer, tunnel)
