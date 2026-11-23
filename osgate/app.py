@@ -68,6 +68,7 @@ def create_app(settings: Settings | None = None, *, connector=None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app):
         app.state.login_attempts = {}
+        app.state.ssh_enrollment_attempts = {}
         await runtime.start()
         try:
             yield

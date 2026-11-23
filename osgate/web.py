@@ -189,13 +189,26 @@ setInterval(updateDashboard,5000);
         for rec in await asyncio.to_thread(db.servers):
             state = states.get(rec['id'], {})
             rows += f'<tr><td>{safe(rec["name"])}</td><td>{safe(rec["host"])}:{rec["port"]}</td><td>{rec["priority"]}</td><td>{rec["weight"]}</td><td class="status {safe(state.get("status", "DISABLED"))}">{safe(state.get("status", "DISABLED"))}</td>'
-            rows += (f'<td><a href="/servers/{rec["id"]}/edit">Изменить / проверить</a> '
+            rows += (f'<td><a href="/servers/{rec["id"]}/edit">Изменить / проверить</a> · '
+                     f'<a href="/servers/{rec["id"]}/onboard">Настроить SSH-доступ</a> '
                      f'<form class="inline" method="post" action="/servers/{rec["id"]}/toggle">{control(request)}<button>{"Отключить" if rec["enabled"] else "Включить"}</button></form>'
                      f'<form class="inline" method="post" action="/servers/{rec["id"]}/delete">{control(request)}<button class="danger">Удалить</button></form></td></tr>')
         rows += '</table></section><section><h2>Добавить SSH-сервер</h2><p class="muted">Ключ и known_hosts сначала разместите в защищённом SSH_DIRECTORY. Fingerprint должен быть подтверждён отдельно.</p>'
+        rows += ('<p>Если сервер ещё не принимает ключ OSGate, '
+                 'отметьте «Настроить SSH-доступ через пароль при добавлении». '
+                 'После установки публичного ключа будет выполнена обычная '
+                 'проверка SSH/TCP forwarding. Потребуется разрешённый '
+                 'парольный вход на удалённом сервере.</p>')
         rows += f'<form method="post" action="/servers/new">{control(request)}'
         for name, value, typ in [('name','','text'),('host','','text'),('port',22,'number'),('username','','text'),('key_file','/ssh/id_ed25519','text'),('known_hosts_file','/ssh/known_hosts','text'),('priority',100,'number'),('weight',1,'number')]:
             rows += esc_input(name, value, typ, True)
+        rows += ('<label><input type="checkbox" name="install_key" value="yes">'
+                 'Настроить SSH-доступ через пароль при добавлении</label>')
+        rows += ('<label>Пароль SSH (только для первоначальной настройки) '
+                 '<input type="password" name="ssh_password" autocomplete="off"></label>')
+        rows += ('<p class="muted">Пароль используется однократно и не хранится. '
+                 'Публичный ключ устанавливается только на сервер с заранее '
+                 'проверенным known_hosts.</p>')
         rows += '<button>Добавить</button></form></section>'
         return page(request, 'SSH-серверы', rows)
 
@@ -212,7 +225,19 @@ setInterval(updateDashboard,5000);
             if not (record['name'] and record['host'] and record['username'] and
                     1 <= record['port'] <= 65535 and 1 <= record['weight'] <= 1000):
                 raise ValueError('Invalid fields')
-            # Confirm SSH transport and TCP forwarding before saving configuration.
+            # Optional one-time enrollment precedes normal SSH/TCP forwarding
+            # verification and never persists the supplied SSH password.
+            if data.get('install_key') == 'yes':
+                from .ssh_onboarding import enroll_public_key
+                key = (request.session['admin'], 'new')
+                attempts = app.state.ssh_enrollment_attempts
+                recent = attempts.setdefault(key, [])
+                now = asyncio.get_running_loop().time()
+                recent[:] = [t for t in recent if now - t < 900]
+                if len(recent) >= 5:
+                    raise HTTPException(429, 'Слишком много попыток SSH. Повторите позже.')
+                recent.append(now)
+                await enroll_public_key(record, config, data.get('ssh_password', ''))
             conn = await asyncio.wait_for(connect_ssh(record, config), timeout=config.ssh_connect_timeout + 2)
             try:
                 reader, writer = await asyncio.wait_for(
@@ -226,8 +251,17 @@ setInterval(updateDashboard,5000);
                 s.add(SSHServer(**record))
             await asyncio.to_thread(db.audit, request.session['admin'], 'server_add', record['name'])
             await ssh.refresh()
+        except HTTPException:
+            raise
         except Exception as exc:
-            return page(request, 'Ошибка добавления сервера', '<p>Конфигурация не сохранена.</p><a href="/servers">Назад</a>', type(exc).__name__)
+            from .ssh_onboarding import EnrollmentError
+            if isinstance(exc, EnrollmentError):
+                reason = safe(str(exc))
+            else:
+                reason = safe(type(exc).__name__)
+            return page(request, 'Ошибка добавления сервера',
+                        '<p>Конфигурация не сохранена.</p><a href="/servers">Назад</a>',
+                        reason)
         return return_to('/servers')
 
     @app.post('/servers/{server_id}/toggle')

@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from .database import Admin, Client, SSHServer, Event, hasher
 from .ssh import connect_ssh
+from .ssh_onboarding import EnrollmentError, enroll_public_key
 from .web import check_csrf, control, esc_input, form_data, page, require_admin, return_to, safe
 
 
@@ -68,7 +69,83 @@ def register_v1_routes(app, runtime):
                               ('primary', 'Сделать основным')):
             body += '<form method="post" action="/servers/%d/%s">%s<button>%s</button></form>' % (
                 server_id, action, control(request), title)
+        body += (f'<p><a href="/servers/{server_id}/onboard">'
+                 'Настроить SSH-доступ (установить публичный ключ)</a></p>')
         return page(request, 'SSH-сервер — редактирование', body + '</section>')
+
+    @app.get('/servers/{server_id}/onboard')
+    async def server_onboarding_form(request: Request, server_id: int):
+        require_admin(request)
+        with db.session() as session:
+            server = session.get(SSHServer, server_id)
+            if server is None:
+                raise HTTPException(404)
+            host, port, username, name = server.host, server.port, server.username, server.name
+        body = '<section><h2>Настроить SSH-доступ</h2>'
+        body += ('<p>OSGate установит публичную часть своего SSH-ключа в '
+                 '<code>~/.ssh/authorized_keys</code> выбранного пользователя.</p>')
+        body += (f'<p>Сервер: <strong>{safe(name)}</strong>, '
+                 f'<code>{safe(username)}@{safe(host)}:{port}</code></p>')
+        body += ('<p>Используется только пароль SSH, подтверждённый host key '
+                 'из существующего файла known_hosts. Пароль не сохраняется '
+                 'в базе и не выводится в журнал.</p>')
+        body += ('<p>Если сервер запрещает PasswordAuthentication, '
+                 'понадобится уже разрешённый SSH-ключ или настройка администратором.</p>')
+        body += f'<form method="post" action="/servers/{server_id}/onboard">'
+        body += control(request)
+        body += ('<label>Пароль пользователя SSH '
+                 '<input type="password" name="ssh_password" required '
+                 'autocomplete="off"></label>')
+        body += ('<label><input type="checkbox" name="confirm_key_install" '
+                 'value="yes" required>Разрешаю установить публичный ключ '
+                 'для этого SSH-пользователя</label>')
+        body += '<button>Установить ключ и проверить SSH</button></form></section>'
+        return page(request, 'Первоначальная настройка SSH', body)
+
+    @app.post('/servers/{server_id}/onboard')
+    async def server_onboarding(request: Request, server_id: int):
+        require_admin(request)
+        data = await form_data(request)
+        check_csrf(request, data)
+        if data.get('confirm_key_install') != 'yes':
+            raise HTTPException(400, 'Подтвердите установку публичного ключа.')
+        # Dedicated in-memory throttle for the high-risk SSH password operation.
+        attempts = app.state.ssh_enrollment_attempts
+        actor = request.session['admin']
+        key = (actor, server_id)
+        now = asyncio.get_running_loop().time()
+        recent = attempts.setdefault(key, [])
+        recent[:] = [t for t in recent if now - t < 900]
+        if len(recent) >= 5:
+            raise HTTPException(429, 'Слишком много попыток SSH. Повторите позже.')
+        with db.session() as session:
+            item = session.get(SSHServer, server_id)
+            if item is None:
+                raise HTTPException(404)
+            record = {name: getattr(item, name) for name in (
+                'name', 'host', 'port', 'username', 'key_file', 'known_hosts_file')}
+        recent.append(now)
+        try:
+            await enroll_public_key(record, cfg, data.get('ssh_password', ''))
+            await probe_ssh(record, cfg)
+        except EnrollmentError as exc:
+            # Only a controlled, generic message. Never echo password or SSH
+            # exception details, which can contain sensitive connection metadata.
+            return page(request, 'Не удалось настроить SSH',
+                        f'<section><p>{safe(exc)}</p>'
+                        f'<a href="/servers/{server_id}/onboard">Повторить</a></section>')
+        except Exception:
+            return page(request, 'Ключ установлен, проверка не прошла',
+                        '<section><p>Публичный ключ добавлен, но проверка SSH/TCP '
+                        'forwarding не пройдена. Проверьте AllowTcpForwarding '
+                        'и доступность HEALTH_TEST_HOST:PORT.</p>'
+                        f'<a href="/servers/{server_id}/edit">Настройки сервера</a></section>')
+        recent.clear()
+        await ssh.refresh()
+        await asyncio.to_thread(db.audit, actor, 'server_ssh_key_enrolled', str(server_id))
+        return page(request, 'SSH успешно настроен',
+                    '<section><p>Публичный ключ установлен. SSH и TCP forwarding '
+                    'успешно проверены.</p><a href="/servers">К серверам</a></section>')
 
     @app.post('/servers/{server_id}/edit')
     async def server_edit(request: Request, server_id: int):
@@ -83,7 +160,10 @@ def register_v1_routes(app, runtime):
             await probe_ssh(fields, cfg)
         except Exception as exc:
             return page(request, 'Проверка не пройдена',
-                        '<section>Изменения не сохранены. <a href="/servers">Назад</a></section>',
+                        '<section>Изменения не сохранены. '
+                        f'<a href="/servers/{server_id}/onboard">'
+                        'Настроить SSH-доступ (установить ключ)</a> · '
+                        '<a href="/servers">Назад</a></section>',
                         type(exc).__name__)
         with db.session() as session:
             item = session.get(SSHServer, server_id)
@@ -105,7 +185,10 @@ def register_v1_routes(app, runtime):
         try:
             await probe_ssh(matches[0], cfg)
         except Exception as exc:
-            return page(request, 'SSH-диагностика', '<p>Проверка SSH/TCP forwarding не пройдена.</p>',
+            return page(request, 'SSH-диагностика',
+                        '<p>Проверка SSH/TCP forwarding не пройдена.</p>'
+                        f'<a href="/servers/{server_id}/onboard">'
+                        'Настроить SSH-доступ (установить ключ)</a>',
                         type(exc).__name__)
         return page(request, 'SSH-диагностика', '<p>SSH и TCP forwarding: OK</p>')
 
