@@ -11,6 +11,9 @@ import time
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 
+from .routing import Router
+from .telegram_ssh_proxy import TelegramSSHProxy
+
 log = logging.getLogger(__name__)
 
 EVENTS = {
@@ -47,6 +50,8 @@ def validate_chat_id(chat_id: str):
 class Notifier:
     def __init__(self, settings):
         self.settings = settings
+        self.ssh = None
+        self.db = None
         self._last = {}
         self.tasks = set()
         self.enabled = settings.telegram_enabled
@@ -56,6 +61,24 @@ class Notifier:
         # httpx normally logs full request URLs (Telegram Bot API has token in
         # path), so suppress its request-level log records globally.
         logging.getLogger('httpx').setLevel(logging.WARNING)
+
+    def bind_ssh(self, ssh, db):
+        """Enable SSH-only delivery using the already initialized SSH manager."""
+        self.ssh = ssh
+        self.db = db
+
+    async def ssh_candidates(self):
+        if self.ssh is None or self.db is None:
+            return []
+        servers = self.ssh.candidates()
+        if not any(s['ready'] for s in servers):
+            return []
+        settings = await asyncio.to_thread(self.db.routing)
+        # Separate router instance: notifications must never alter SOCKS
+        # failover state, round-robin counters or sticky assignments.
+        return Router().candidates(
+            servers, settings, {'id': 0, 'pinned_server_id': None,
+                                'allow_fallback': False})
 
     def load(self, db):
         enabled = db.get_setting('telegram_enabled', '')
@@ -109,15 +132,37 @@ class Notifier:
     async def _send(self, message, *, token=None, chat_id=None):
         value = token if token is not None else self.token
         destination = chat_id if chat_id is not None else self.chat_id
-        try:
-            async with httpx.AsyncClient(timeout=8, trust_env=False) as session:
-                response = await session.post(
-                    f'https://api.telegram.org/bot{value}/sendMessage',
-                    json={'chat_id': destination, 'text': message})
-                return bool(response.is_success and response.json().get('ok'))
-        except (httpx.HTTPError, ValueError, KeyError):
-            log.warning('Telegram message delivery failed')
+        # Fail-closed: no SSH manager/ready server means no outgoing socket.
+        # Telegram traffic MUST NEVER use direct networking from OSGate.
+        candidates = await self.ssh_candidates()
+        if not candidates:
+            log.warning('Telegram delivery skipped: no working SSH exit')
             return False
+        for server in candidates:
+            try:
+                async with TelegramSSHProxy(self.ssh, server['id']) as proxy:
+                    async with httpx.AsyncClient(
+                        timeout=12, trust_env=False,
+                        proxy=f'http://127.0.0.1:{proxy.port}'
+                    ) as session:
+                        response = await session.post(
+                            f'https://api.telegram.org/bot{value}/sendMessage',
+                            json={'chat_id': destination, 'text': message})
+                        if response.is_success:
+                            return bool(response.json().get('ok'))
+                        # A Telegram HTTP rejection (401/400 etc.) is a
+                        # credential/request error, not SSH failover.
+                        log.warning('Telegram API rejected message, status=%s',
+                                    response.status_code)
+                        return False
+            except (httpx.HTTPError, OSError, ConnectionError, asyncio.TimeoutError):
+                # Retry over the next healthy SSH exit. No direct fallback.
+                log.warning('Telegram delivery via SSH failed: server_id=%s',
+                            server['id'])
+            except (ValueError, KeyError):
+                log.warning('Telegram API response could not be decoded')
+                return False
+        return False
 
     async def test(self):
         if not self.token or not self.chat_id:
