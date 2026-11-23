@@ -1,0 +1,26 @@
+[Unit]
+Description=OSGate SOCKS5 over SSH gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=osgate
+Group=osgate
+WorkingDirectory=/opt/osgate
+EnvironmentFile=/etc/osgate/osgate.env
+ExecStart=/opt/osgate/.venv/bin/osgate start
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/osgate
+ReadOnlyPaths=/etc/osgate
+PrivateTmp=true
+RestrictSUIDSGID=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

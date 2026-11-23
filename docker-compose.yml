@@ -1,0 +1,30 @@
+services:
+  osgate:
+    build: .
+    image: ghcr.io/ogsvnv/osgate:0.1.0-alpha
+    container_name: osgate
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5812:5812"
+      - "127.0.0.1:1080:1080"
+    volumes:
+      - ./data:/data
+      - ./ssh:/ssh:ro
+    env_file: .env
+    environment:
+      # Docker's port publishing commonly forwards via the bridge gateway,
+      # not 127.0.0.1. Only the host loopback ports above are published.
+      # Use a narrower gateway /32 when you know your Docker network.
+      WEB_ALLOWED_CIDRS: "${DOCKER_WEB_ALLOWED_CIDRS:-127.0.0.1/32,::1/128,172.16.0.0/12}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m
+    healthcheck:
+      test: ["CMD", "python", "-m", "osgate.healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
