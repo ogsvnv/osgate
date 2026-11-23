@@ -37,7 +37,9 @@ async def test_charts_are_on_main_dashboard_and_authenticated(setup):
             assert 'Задержка SSH-серверов' in main.text
             assert 'не ICMP ping' in main.text
             assert 'updateDashboard();setInterval(updateDashboard,5000);' in main.text
-            assert "renderDashboardTraffic(m);renderDashboardLatency(s);" in main.text
+            assert "renderDashboardTraffic(m);" in main.text
+            assert "renderDashboardLatency(s,await c.json());" in main.text
+            assert "fetch('/api/ssh-latency',{cache:'no-store'})" in main.text
             assert "fetch('/api/metrics',{cache:'no-store'})" in main.text
             assert "fetch('/api/status',{cache:'no-store'})" in main.text
             assert 'https://cdn' not in main.text
@@ -81,4 +83,4 @@ def test_dashboard_javascript_has_valid_syntax_and_rates():
 def test_dashboard_html_has_accessible_canvas_labels():
     assert 'aria-label="График скорости исходящего и входящего трафика"' in DASHBOARD_CHARTS_HTML
     assert 'aria-label="График задержки SSH-серверов"' in DASHBOARD_CHARTS_HTML
-    assert 'мс' in DASHBOARD_CHARTS_HTML
+    assert '10 минут' in DASHBOARD_CHARTS_HTML

@@ -116,6 +116,13 @@ class SSHManager:
         if self.notify:
             await self.notify(category, message)
 
+    async def _save_latency(self, server_id: int, latency_ms: float | None):
+        try:
+            await asyncio.to_thread(self.db.record_ssh_latency, server_id, latency_ms)
+        except Exception:
+            # Metrics failure must never prevent SSH health checks/failover.
+            log.warning('Could not persist SSH latency sample')
+
     async def _maintain(self, state: State):
         delay = self.settings.ssh_reconnect_initial_delay
         try:
@@ -152,6 +159,7 @@ class SSHManager:
                             state.latency_ms = round((time.monotonic() - begin) * 1000, 1)
                             state.successes += 1
                             state.failures = 0
+                            await self._save_latency(state.record['id'], state.latency_ms)
                             if state.successes >= self.settings.health_success_threshold:
                                 if not state.verified:
                                     await self._emit('SSH', f"{state.record['name']}: ONLINE")
@@ -160,6 +168,8 @@ class SSHManager:
                         except (Exception,) as exc:
                             if isinstance(exc, asyncio.CancelledError):
                                 raise
+                            state.latency_ms = None
+                            await self._save_latency(state.record['id'], None)
                             state.failures += 1
                             state.successes = 0
                             state.last_error = type(exc).__name__
@@ -175,6 +185,7 @@ class SSHManager:
                     raise
                 except Exception as exc:
                     # Exception class only, as transport errors may include sensitive paths.
+                    state.latency_ms = None
                     state.last_error = type(exc).__name__
                     log.warning('SSH %s connection failed: %s', state.record['name'], type(exc).__name__)
                 finally:

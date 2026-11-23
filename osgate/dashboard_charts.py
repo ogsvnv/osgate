@@ -15,7 +15,7 @@ DASHBOARD_CHARTS_HTML = """
   </section>
   <section class="dashboard-chart">
     <h2>Задержка SSH-серверов</h2>
-    <p class="muted">мс · время проверки TCP через SSH (не ICMP ping)</p>
+    <p class="muted">Последние 10 минут · TCP через SSH (не ICMP ping)</p>
     <div class="chart-key" id="dashboard-ping-legend"></div>
     <canvas id="dashboard-ping-chart" height="220" role="img"
             aria-label="График задержки SSH-серверов"></canvas>
@@ -38,7 +38,6 @@ DASHBOARD_CHARTS_CSS = """
 # All runtime strings and SSH-server names are written with textContent,
 # never innerHTML. No external libraries or CDN access needed.
 DASHBOARD_CHARTS_JS = r"""
-const dashboardLatency = new Map();
 const DASHBOARD_PALETTE = ['#7c9dff','#59d394','#edb95a','#d68be9','#ed8888','#68cbd3'];
 
 function dashboardPlot(canvas, series, unit, captions){
@@ -123,36 +122,43 @@ function renderDashboardTraffic(metrics){
   document.getElementById('dashboard-traffic-caption').textContent=
     pts.length?'Последняя точка: '+labels[labels.length-1]:'История трафика появится после двух замеров (интервал 60 с).';
 }
-function renderDashboardLatency(status){
+function renderDashboardLatency(status,history){
   const active=Array.isArray(status.ssh_servers)?status.ssh_servers:[];
-  const current=new Set(active.map(s=>String(s.id)));
-  for(const id of dashboardLatency.keys())if(!current.has(id))dashboardLatency.delete(id);
-  for(const server of active){
-    const id=String(server.id);
-    const row=dashboardLatency.get(id)||{name:String(server.name),values:[]};
-    row.name=String(server.name);
-    const ms=Number(server.latency_ms);
-    row.values.push(server.ready&&server.latency_ms!==null&&Number.isFinite(ms)&&ms>=0?ms:null);
-    if(row.values.length>60)row.values.shift();
-    dashboardLatency.set(id,row);
-  }
-  const rows=Array.from(dashboardLatency.values()).slice(0,6);
-  const length=Math.max(0,...rows.map(s=>s.values.length));
-  const series=rows.map((s,i)=>({color:DASHBOARD_PALETTE[i],
-    values:Array(length-s.values.length).fill(null).concat(s.values)}));
+  const rows=active.slice(0,6);
+  const samples=Array.isArray(history?.samples)?history.samples:[];
+  const end=Date.now(),start=end-600000;
+  // Fixed 10-minute time axis; samples grouped into 30-second buckets.
+  // Missing or failed probes stay null, so no invented 0ms results.
+  const slots=21;
+  const bucketMs=30000;
+  const series=rows.map((server,i)=>{
+    const values=Array(slots).fill(null);
+    for(const point of samples){
+      if(String(point.server_id)!==String(server.id))continue;
+      const timestamp=Date.parse(point.time);
+      if(!Number.isFinite(timestamp)||timestamp<start||timestamp>end)continue;
+      const slot=Math.min(slots-1,Math.floor((timestamp-start)/bucketMs));
+      const ms=Number(point.latency_ms);
+      values[slot]=point.latency_ms!==null&&Number.isFinite(ms)&&ms>=0?ms:null;
+    }
+    return {color:DASHBOARD_PALETTE[i],values};
+  });
   const legend=document.getElementById('dashboard-ping-legend');
   legend.replaceChildren();
   rows.forEach((row,i)=>{
     const item=document.createElement('span');
     item.style.color=DASHBOARD_PALETTE[i];
-    item.textContent='● '+row.name;
+    item.textContent='● '+String(row.name);
     legend.appendChild(item);
   });
-  const captions=Array(length).fill('');
-  if(length){captions[0]='раньше';captions[length-1]='сейчас'}
-  dashboardPlot(document.getElementById('dashboard-ping-chart'),series,'мс',captions);
-  document.getElementById('dashboard-ping-caption').textContent=
-    rows.length?'До 60 точек по 5 секунд, с момента открытия панели. Отключённые серверы не рисуются как 0 мс.':
+  const labels=Array(slots).fill('');
+  for(const i of [0,10,20]){
+    labels[i]=new Date(start+i*bucketMs).toLocaleTimeString(
+      'ru-RU',{hour:'2-digit',minute:'2-digit'});
+  }
+  dashboardPlot(document.getElementById('dashboard-ping-chart'),series,'мс',labels);
+  document.getElementById('dashboard-ping-caption').textContent=rows.length?
+    'История 10 минут сохраняется в SQLite и восстанавливается после обновления страницы. Пропуски означают отсутствие успешной проверки.':
     'Добавьте SSH-сервер для отображения задержки.';
 }
 """

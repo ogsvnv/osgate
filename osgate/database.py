@@ -5,7 +5,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from argon2 import PasswordHasher
 from sqlalchemy import (create_engine, event, String, Integer, Boolean, Float, DateTime,
-                        ForeignKey, BigInteger, select, func)
+                        ForeignKey, BigInteger, select, func, Index)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 hasher = PasswordHasher(time_cost=2, memory_cost=65536, parallelism=2)
@@ -77,6 +77,15 @@ class TrafficSample(Base):
     bytes_uploaded: Mapped[int] = mapped_column(BigInteger, default=0)
     bytes_downloaded: Mapped[int] = mapped_column(BigInteger, default=0)
     active_connections: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class SSHLatencySample(Base):
+    __tablename__ = 'ssh_latency_samples'
+    __table_args__ = (Index('ix_ssh_latency_samples_when', 'when'),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    server_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    when: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class Event(Base):
@@ -230,6 +239,51 @@ class Database:
                  'uploaded': x.bytes_uploaded,
                  'downloaded': x.bytes_downloaded, 'active': x.active_connections}
                 for x in reversed(rows)]
+
+    def record_ssh_latency(self, server_id: int, latency_ms: float | None,
+                           *, when: datetime | None = None):
+        """Store a real forwarded-TCP measurement or NULL on failed probe.
+
+        Keep only 10 minutes; prune on every insertion without accumulating
+        historical data when the browser is closed.
+        """
+        import math
+        if latency_ms is not None and (not math.isfinite(latency_ms) or latency_ms < 0):
+            latency_ms = None
+        now = when or utcnow()
+        if now.tzinfo is None:
+            raise ValueError('Timestamp must be timezone-aware')
+        cutoff = now - timedelta(minutes=10)
+        with self.session() as session:
+            session.add(SSHLatencySample(
+                server_id=server_id, when=now, latency_ms=latency_ms))
+            session.query(SSHLatencySample).filter(
+                SSHLatencySample.when < cutoff).delete(synchronize_session=False)
+
+    def purge_ssh_latency(self):
+        # Purge even when servers are offline and not writing samples.
+        with self.session() as session:
+            session.query(SSHLatencySample).filter(
+                SSHLatencySample.when < utcnow() - timedelta(minutes=10)
+            ).delete(synchronize_session=False)
+
+    def recent_ssh_latency(self, *, now: datetime | None = None):
+        """Return bounded chronological sample stream for the last 10 minutes."""
+        current = now or utcnow()
+        if current.tzinfo is None:
+            raise ValueError('Timestamp must be timezone-aware')
+        cutoff = current - timedelta(minutes=10)
+        with self.session() as session:
+            rows = list(session.scalars(
+                select(SSHLatencySample)
+                .where(SSHLatencySample.when >= cutoff,
+                       SSHLatencySample.when <= current)
+                .order_by(SSHLatencySample.when, SSHLatencySample.id)
+                .limit(5000)))
+        return [{'server_id': row.server_id,
+                 'time': (row.when if row.when.tzinfo else
+                          row.when.replace(tzinfo=timezone.utc)).isoformat(),
+                 'latency_ms': row.latency_ms} for row in rows]
 
     def event(self, category: str, message: str):
         with self.session() as s:
