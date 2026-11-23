@@ -167,10 +167,11 @@ def register_routes(app, runtime):
         body += """</table></section><section><a href="/metrics">Графики трафика</a></section>
 <script>
 async function updateDashboard(){try{
- const [a,b]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/metrics',{cache:'no-store'})]);
+ const [a,b,c]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/metrics',{cache:'no-store'}),fetch('/api/ssh-latency',{cache:'no-store'})]);
  if(!a.ok||!b.ok)return;
  const s=await a.json(),m=await b.json();
- renderDashboardTraffic(m);renderDashboardLatency(s);
+ renderDashboardTraffic(m);
+ if(c.ok)renderDashboardLatency(s,await c.json());
  const values=[s.ssh_servers.some(x=>x.ready)?'ONLINE':'NO SSH',s.socks_running?'RUNNING':'STOPPED',
  s.ssh_servers.filter(x=>x.ready).length+' / '+s.ssh_servers.length,
  s.active_connections,s.completed_connections,s.rejected_connections,s.active_clients,
@@ -519,6 +520,13 @@ updateDashboard();setInterval(updateDashboard,5000);
                 '<p>Чувствительные параметры не отображаются.</p></section>')
         body += '<section><a href="/admin/password">Смена пароля администратора</a> · <a href="/settings/runtime">Параметры работы</a> · <a href="/metrics">Графики</a></section>'
         return page(request, 'Настройки', body)
+
+    @app.get('/api/ssh-latency')
+    async def api_ssh_latency(request: Request):
+        require_admin(request)
+        samples = await asyncio.to_thread(db.recent_ssh_latency)
+        return JSONResponse({'window_seconds': 600, 'samples': samples},
+                            headers={'Cache-Control': 'no-store'})
 
     @app.get('/api/status')
     async def api_status(request: Request):

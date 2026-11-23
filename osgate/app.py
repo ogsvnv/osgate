@@ -43,6 +43,7 @@ class Runtime:
             try:
                 await asyncio.to_thread(self.db.sample_traffic, len(self.socks.active),
                                         self.settings.traffic_retention_days)
+                await asyncio.to_thread(self.db.purge_ssh_latency)
             except Exception:
                 log.exception('Traffic snapshot error')
             await asyncio.sleep(60)
