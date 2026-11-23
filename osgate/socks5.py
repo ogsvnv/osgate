@@ -61,6 +61,7 @@ class SocksServer:
         self.router = Router()
         self.server = None
         self.active: dict[int, Tunnel] = {}
+        self._handlers: set[asyncio.Task] = set()
         self.counts: dict[int, int] = {}
         self._lock = asyncio.Lock()
         self._sequence = 0
@@ -76,11 +77,15 @@ class SocksServer:
     async def stop(self):
         if self.server:
             self.server.close()
-            await self.server.wait_closed()
-        tasks = [x.task for x in self.active.values() if x.task and x.task is not asyncio.current_task()]
+        # asyncio.Server.wait_closed() may also wait for active handlers. Cancel
+        # them before awaiting listener shutdown, including incomplete handshakes.
+        tasks = [task for task in self._handlers if task is not asyncio.current_task()]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        if self.server:
+            await self.server.wait_closed()
+            self.server = None
 
     async def disconnect(self, tunnel_id):
         entry = self.active.get(tunnel_id)
@@ -121,6 +126,12 @@ class SocksServer:
         while True:
             data = await asyncio.wait_for(reader.read(65536), self.settings.socks_idle_timeout)
             if not data:
+                # A lost SSH transport terminates the entire TCP tunnel, rather
+                # than leaving the client-to-SSH pump blocked until idle timeout.
+                if direction == 'download':
+                    state = self.ssh.states.get(tunnel.ssh_server_id)
+                    if not state or not state.connection or state.connection.is_closed():
+                        raise ConnectionError('SSH transport lost')
                 if hasattr(writer, 'can_write_eof') and writer.can_write_eof():
                     writer.write_eof()
                     await writer.drain()
@@ -132,7 +143,23 @@ class SocksServer:
             else:
                 tunnel.downloaded += len(data)
 
+    async def _relay(self, reader, writer, channel_reader, channel_writer, tunnel):
+        pumps = (
+            asyncio.create_task(self._pump(reader, channel_writer, tunnel, 'upload')),
+            asyncio.create_task(self._pump(channel_reader, writer, tunnel, 'download')),
+        )
+        try:
+            await asyncio.gather(*pumps)
+        except BaseException:
+            # asyncio.gather does not cancel sibling tasks after an exception.
+            for pump in pumps:
+                pump.cancel()
+            await asyncio.gather(*pumps, return_exceptions=True)
+            raise
+
     async def _handle(self, reader, writer):
+        task = asyncio.current_task()
+        self._handlers.add(task)
         ident = None
         channel_writer = None
         tunnel = None
@@ -178,8 +205,7 @@ class SocksServer:
                 self.active[tunnel.id] = tunnel
                 writer.write(reply(0)); await writer.drain()
             # Both halves run independently, allowing TCP half-closure.
-            await asyncio.gather(self._pump(reader, channel_writer, tunnel, 'upload'),
-                                 self._pump(channel_reader, writer, tunnel, 'download'))
+            await self._relay(reader, writer, channel_reader, channel_writer, tunnel)
         except asyncio.CancelledError:
             raise
         except (ValueError, TypeError, UnicodeDecodeError, asyncio.IncompleteReadError,
@@ -209,3 +235,4 @@ class SocksServer:
             if ident is not None:
                 async with self._lock:
                     self.counts[ident] = max(0, self.counts.get(ident, 0) - 1)
+            self._handlers.discard(task)
