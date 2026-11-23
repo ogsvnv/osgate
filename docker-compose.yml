@@ -11,6 +11,11 @@ services:
       - ./data:/data
       - ./ssh:/ssh:ro
     env_file: .env
+    environment:
+      # Docker's port publishing commonly forwards via the bridge gateway,
+      # not 127.0.0.1. Only the host loopback ports above are published.
+      # Use a narrower gateway /32 when you know your Docker network.
+      WEB_ALLOWED_CIDRS: "${DOCKER_WEB_ALLOWED_CIDRS:-127.0.0.1/32,::1/128,172.16.0.0/12}"
     security_opt:
       - no-new-privileges:true
     cap_drop:
