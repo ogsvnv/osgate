@@ -1,5 +1,18 @@
 # Установка OSGate (мастер)
 
+На новой машине можно начать одной командой:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ogsvnv/osgate/main/bootstrap.sh | bash
+```
+
+Скрипт скачивает репозиторий в `~/osgate`, затем запускает интерактивный мастер
+с правами администратора через `sudo`. Ввод паролей идёт напрямую через терминал.
+Чтобы сразу выбрать Docker: `curl -fsSL https://raw.githubusercontent.com/ogsvnv/osgate/main/bootstrap.sh | bash -s -- --mode docker`.
+
+**Без выполнения скрипта напрямую из сети:** `curl -fsSLo bootstrap.sh https://raw.githubusercontent.com/ogsvnv/osgate/main/bootstrap.sh`,
+изучите его, затем выполните `bash bootstrap.sh`.
+
 В репозитории предусмотрен интерактивный мастер **`install.sh`**. Он запускается локально из
 проверенного клона GitHub на Ubuntu/Debian Linux и не требует curl|bash.
 
