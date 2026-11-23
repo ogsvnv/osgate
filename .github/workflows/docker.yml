@@ -25,4 +25,4 @@ jobs:
         with:
           context: .
           push: true
-          tags: ghcr.io/ogsvnv/osgate:latest
+          tags: ghcr.io/ogsvnv/osgate:0.1.0-alpha
