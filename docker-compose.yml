@@ -6,7 +6,7 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:${OSGATE_HOST_WEB_PORT:-5812}:5812"
-      - "127.0.0.1:${OSGATE_HOST_SOCKS_PORT:-1080}:1080"
+      - "${OSGATE_HOST_SOCKS_BIND:-127.0.0.1}:${OSGATE_HOST_SOCKS_PORT:-1080}:1080"
     volumes:
       - ./data:/data
       - ./ssh:/ssh:ro

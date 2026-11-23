@@ -25,7 +25,7 @@ def test_systemd_unit_is_unprivileged_and_persistent():
 def test_compose_bridge_ip_and_loopback_publishing():
     content = (ROOT / "docker-compose.yml").read_text()
     assert '"127.0.0.1:${OSGATE_HOST_WEB_PORT:-5812}:5812"' in content
-    assert '"127.0.0.1:${OSGATE_HOST_SOCKS_PORT:-1080}:1080"' in content
+    assert '"${OSGATE_HOST_SOCKS_BIND:-127.0.0.1}:${OSGATE_HOST_SOCKS_PORT:-1080}:1080"' in content
     assert "DOCKER_WEB_ALLOWED_CIDRS" in content
     assert "172.16.0.0/12" in content
     assert "no-new-privileges:true" in content

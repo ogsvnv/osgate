@@ -7,6 +7,7 @@ All secrets are written with restricted permissions and never passed as argument
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import os
 from pathlib import Path
 import pwd
@@ -110,6 +111,69 @@ def unused_local_port(port: int):
             sock.bind(("127.0.0.1", port))
         except OSError as exc:
             raise InstallError(f"Порт 127.0.0.1:{port} уже занят.") from exc
+
+
+def bind_address(raw: str) -> str:
+    """Only IPv4 listener addresses. Hostnames can resolve to unexpected interfaces."""
+    try:
+        return str(ipaddress.IPv4Address(raw))
+    except ipaddress.AddressValueError as exc:
+        raise InstallError("Укажите действительный IPv4-адрес интерфейса.") from exc
+
+
+def interface_addresses() -> set[str]:
+    """Collect local interface IPv4 addresses using the OS ip utility, if present."""
+    addresses = {"127.0.0.1", "0.0.0.0"}
+    if not shutil.which("ip"):
+        return addresses
+    result = run("ip", "-o", "-4", "addr", "show", capture=True, check=False)
+    for match in re.finditer(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/\d+", result.stdout):
+        addresses.add(match.group(1))
+    return addresses
+
+
+def validate_socks_bind(raw: str, *, require_local=True) -> str:
+    address = bind_address(raw)
+    if require_local and address not in interface_addresses():
+        raise InstallError(
+            f"Адрес {address} не назначен ни одному интерфейсу сервера. "
+            "Выберите адрес из 'ip -4 addr'.")
+    return address
+
+
+def select_socks_access() -> str:
+    """Explicit listening policy for SOCKS5; admin panel stays loopback-only."""
+    section("Доступность SOCKS5-прокси")
+    print("1 — Только на сервере (127.0.0.1), рекомендуется")
+    print("2 — Через все интерфейсы (0.0.0.0) — доступ извне")
+    print("3 — Через указанный IPv4-адрес интерфейса")
+    choice = ask("Режим SOCKS5", "1")
+    if choice == "1":
+        return "127.0.0.1"
+    if choice == "2":
+        print("ВНИМАНИЕ: SOCKS5 станет доступен по сети. "
+              "Авторизация обязательна, ограничьте доступ firewall/ACL. "
+              "Docker может обходить правила UFW через NAT; проверяйте DOCKER-USER.")
+        if not yesno("Подтвердить публикацию SOCKS5 на всех интерфейсах?", False):
+            raise InstallError("Публикация SOCKS5 отменена.")
+        return "0.0.0.0"
+    if choice == "3":
+        address = validate_socks_bind(ask("Локальный IPv4 интерфейса"))
+        if address != "127.0.0.1":
+            print(f"SOCKS5 будет доступен через интерфейс {address}; проверьте firewall.")
+            if not yesno(f"Разрешить прослушивание {address}?", False):
+                raise InstallError("Настройка доступа отменена.")
+        return address
+    raise InstallError("Выберите режим доступа 1, 2 или 3.")
+
+
+def check_bind_port(address: str, port: int):
+    """Check only the interface that will listen, not an unrelated loopback."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((address, port))
+        except OSError as exc:
+            raise InstallError(f"Нельзя занять {address}:{port}. Проверьте интерфейс и порт.") from exc
 
 
 def atomic_secret(path: Path, content: str, replace=False):
@@ -323,10 +387,9 @@ def docker_install():
     socks_port = port_value(ask("Порт SOCKS5 на хосте", "1080"))
     if web_port == socks_port:
         raise InstallError("Порты веб-панели и SOCKS5 должны различаться.")
-    unused_local_port(web_port)
-    unused_local_port(socks_port)
-    if not yesno("Порты будут доступны только на 127.0.0.1. Продолжить?", True):
-        raise InstallError("Установка отменена.")
+    socks_bind = select_socks_access()
+    check_bind_port("127.0.0.1", web_port)
+    check_bind_port(socks_bind, socks_port)
     data = ROOT / "data"
     ssh_dir = ROOT / "ssh"
     for directory in (data, ssh_dir):
@@ -341,6 +404,7 @@ def docker_install():
         "SESSION_SECRET": secrets.token_hex(32),
         "OSGATE_HOST_WEB_PORT": str(web_port),
         "OSGATE_HOST_SOCKS_PORT": str(socks_port),
+        "OSGATE_HOST_SOCKS_BIND": socks_bind,
     })
     atomic_secret(ROOT / ".env", env)
     info("Создана конфигурация .env (0600); firewall не изменялся.")
@@ -355,7 +419,7 @@ def docker_install():
     if not check_health(web_port):
         raise InstallError("Контейнер создан, но /healthz не ответил. Проверьте: docker compose logs --tail 100")
     info(f"OSGate запущен: http://127.0.0.1:{web_port}")
-    info(f"SOCKS5: 127.0.0.1:{socks_port} · Логин администратора: {admin}")
+    info(f"SOCKS5: {socks_bind}:{socks_port} · Логин администратора: {admin}")
     print("Веб-панель с другого компьютера: используйте SSH-туннель, не открывайте порт в интернет.")
     print(f"  ssh -L {web_port}:127.0.0.1:{web_port} <user>@<OSGate-host>")
     if not remote:
@@ -404,8 +468,9 @@ def systemd_install():
     socks_port = port_value(ask("Локальный порт SOCKS5", "1080"))
     if web_port == socks_port:
         raise InstallError("Порты должны различаться.")
-    unused_local_port(web_port)
-    unused_local_port(socks_port)
+    socks_bind = select_socks_access()
+    check_bind_port("127.0.0.1", web_port)
+    check_bind_port(socks_bind, socks_port)
     if not yesno("Установить системную службу? Firewall не изменяется.", True):
         raise InstallError("Установка отменена.")
     SYSTEM_ROOT.parent.mkdir(parents=True, exist_ok=True)
@@ -414,7 +479,7 @@ def systemd_install():
     env = SYSTEM_ENV.read_text(encoding="utf-8")
     atomic_secret(SYSTEM_ENV, set_env_values(env, {
         "WEB_PORT": str(web_port), "SOCKS_PORT": str(socks_port),
-        "WEB_HOST": "127.0.0.1", "SOCKS_HOST": "127.0.0.1",
+        "WEB_HOST": "127.0.0.1", "SOCKS_HOST": socks_bind,
     }), replace=True)
     shutil.chown(SYSTEM_ENV, user="root", group="osgate")
     os.chmod(SYSTEM_ENV, 0o640)
@@ -429,6 +494,7 @@ def systemd_install():
     if not check_health(web_port):
         raise InstallError("Служба создана, но /healthz не ответил. Проверьте: journalctl -u osgate -n 100")
     info(f"OSGate запущен: http://127.0.0.1:{web_port}")
+    info(f"SOCKS5 слушает {socks_bind}:{socks_port}")
     info("Автозапуск через systemd включён. Для проверки: sudo systemctl status osgate")
     if not remote:
         print("Добавьте SSH-сервер и SOCKS5-клиента через веб-панель.")
@@ -488,6 +554,84 @@ def update(mode: str):
         info("Служба обновлена; конфигурация и данные сохранены.")
 
 
+def configure_access(mode: str):
+    """Change only SOCKS bind address; keep all other values and data intact."""
+    require_root()
+    section(f"Изменение доступа SOCKS5 · {mode}")
+    if mode == "docker":
+        docker_preflight()
+        path = ROOT / ".env"
+        if not path.is_file() or path.is_symlink():
+            raise InstallError("Не найден безопасный файл .env Docker.")
+        current = path.read_text(encoding="utf-8")
+        # Legacy configs published only on localhost: avoid guessing broad access.
+        old_bind = re.search(r"(?m)^OSGATE_HOST_SOCKS_BIND=(.+)$", current)
+        current_bind = old_bind.group(1) if old_bind else "127.0.0.1"
+        new_bind = select_socks_access()
+        if new_bind == current_bind:
+            info("Доступ не изменился.")
+            return
+        if not yesno(f"Применить SOCKS5 {current_bind} → {new_bind}? "
+                     "Docker-контейнер будет пересоздан.", False):
+            raise InstallError("Изменение доступа отменено.")
+        updated = set_env_values(current, {"OSGATE_HOST_SOCKS_BIND": new_bind})
+        # Store a rollback snapshot before changing the environment.
+        backup = ROOT / "backups"
+        backup.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(backup, 0o700)
+        old = backup / f"osgate-env-{time.time_ns()}.bak"
+        atomic_secret(old, current)
+        atomic_secret(path, updated, replace=True)
+        try:
+            docker("config", "--quiet")
+            docker("up", "-d", "--no-build")
+        except InstallError:
+            atomic_secret(path, current, replace=True)
+            # Best effort to return to the old port mapping.
+            try:
+                docker("up", "-d", "--no-build")
+            except InstallError:
+                pass
+            raise
+        info(f"SOCKS5: {new_bind} · Старая конфигурация: {old}")
+    else:
+        path = SYSTEM_ENV
+        if not path.is_file() or path.is_symlink():
+            raise InstallError("Не найдена безопасная конфигурация systemd.")
+        current = path.read_text(encoding="utf-8")
+        match = re.search(r"(?m)^SOCKS_HOST=(.+)$", current)
+        old_bind = match.group(1) if match else "127.0.0.1"
+        new_bind = select_socks_access()
+        if new_bind == old_bind:
+            info("Доступ не изменился.")
+            return
+        if not yesno(f"Применить SOCKS5 {old_bind} → {new_bind}? "
+                     "Служба будет перезапущена.", False):
+            raise InstallError("Изменение доступа отменено.")
+        updated = set_env_values(current, {"SOCKS_HOST": new_bind})
+        backup = ROOT / "backups"
+        backup.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(backup, 0o700)
+        old = backup / f"osgate-systemd-env-{time.time_ns()}.bak"
+        atomic_secret(old, current)
+        atomic_secret(path, updated, replace=True)
+        shutil.chown(path, user="root", group="osgate")
+        os.chmod(path, 0o640)
+        try:
+            run("systemctl", "restart", "osgate")
+        except InstallError:
+            atomic_secret(path, current, replace=True)
+            shutil.chown(path, user="root", group="osgate")
+            os.chmod(path, 0o640)
+            try:
+                run("systemctl", "restart", "osgate")
+            except InstallError:
+                pass
+            raise
+        info(f"SOCKS5: {new_bind} · Старая конфигурация: {old}")
+    print("Firewall автоматически не изменялся; проверьте доступ с доверенного IP.")
+
+
 def check(mode: str) -> bool:
     section(f"Диагностика · {mode}")
     if mode == "docker":
@@ -526,6 +670,8 @@ def main(argv=None) -> int:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--check", action="store_true", help="Диагностика установки")
     group.add_argument("--update", action="store_true", help="Обновление с сохранением данных")
+    group.add_argument("--access", action="store_true",
+                       help="Изменить доступность SOCKS5 без переустановки")
     args = parser.parse_args(argv)
     print("\n  OSGate · мастер установки\n  SOCKS5 → SSH → Internet\n")
     try:
@@ -536,6 +682,8 @@ def main(argv=None) -> int:
             return 0 if check(mode) else 1
         if args.update:
             update(mode)
+        elif args.access:
+            configure_access(mode)
         elif mode == "docker":
             docker_install()
         else:
