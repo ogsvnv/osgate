@@ -1,5 +1,6 @@
 """SQLite models and small session-scoped repository methods."""
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import secrets
 from pathlib import Path
 from contextlib import contextmanager
 from argon2 import PasswordHasher
@@ -61,6 +62,21 @@ class Routing(Base):
     mode: Mapped[str] = mapped_column(String(40), default='failover')
     manual_server_id: Mapped[int | None] = mapped_column(Integer)
     auto_failback: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class ApplicationSetting(Base):
+    __tablename__ = 'application_settings'
+    key: Mapped[str] = mapped_column(String(120), primary_key=True)
+    value: Mapped[str] = mapped_column(String(500))
+
+
+class TrafficSample(Base):
+    __tablename__ = 'traffic_samples'
+    id: Mapped[int] = mapped_column(primary_key=True)
+    when: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    bytes_uploaded: Mapped[int] = mapped_column(BigInteger, default=0)
+    bytes_downloaded: Mapped[int] = mapped_column(BigInteger, default=0)
+    active_connections: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Event(Base):
@@ -151,8 +167,10 @@ class Database:
     def routing(self):
         with self.session() as s:
             x = s.get(Routing, 1)
+            delay = s.get(ApplicationSetting, 'failback_delay')
             return dict(mode=x.mode, manual_server_id=x.manual_server_id,
-                        auto_failback=x.auto_failback)
+                        auto_failback=x.auto_failback,
+                        failback_delay=float(delay.value) if delay else 60.0)
 
     def record_traffic(self, client_id: int, upload: int, download: int):
         with self.session() as s:
@@ -166,6 +184,50 @@ class Database:
     def audit(self, actor: str, action: str, detail: str = ''):
         with self.session() as s:
             s.add(Audit(actor=actor, action=action, detail=detail[:300]))
+
+    def get_setting(self, key: str, default: str = '') -> str:
+        with self.session() as session:
+            obj = session.get(ApplicationSetting, key)
+            return obj.value if obj else default
+
+    def set_setting(self, key: str, value: str):
+        if len(key) > 120 or len(value) > 500:
+            raise ValueError('Setting too long')
+        with self.session() as session:
+            obj = session.get(ApplicationSetting, key)
+            if obj is None:
+                session.add(ApplicationSetting(key=key, value=value))
+            else:
+                obj.value = value
+
+    def auth_generation(self):
+        return self.get_setting('admin_auth_generation', '0')
+
+    def revoke_admin_sessions(self):
+        self.set_setting('admin_auth_generation', secrets.token_urlsafe(32))
+
+    def traffic_totals(self):
+        with self.session() as session:
+            up, down = session.execute(select(
+                func.coalesce(func.sum(Client.bytes_uploaded), 0),
+                func.coalesce(func.sum(Client.bytes_downloaded), 0))).one()
+            return int(up), int(down)
+
+    def sample_traffic(self, active_count: int, retention_days: int = 7):
+        up, down = self.traffic_totals()
+        with self.session() as session:
+            session.add(TrafficSample(bytes_uploaded=up, bytes_downloaded=down,
+                                      active_connections=active_count))
+            threshold = utcnow() - timedelta(days=retention_days)
+            session.query(TrafficSample).filter(TrafficSample.when < threshold).delete()
+
+    def recent_samples(self, limit=120):
+        with self.session() as session:
+            rows = list(session.scalars(select(TrafficSample).order_by(
+                TrafficSample.id.desc()).limit(limit)))
+        return [{'time': x.when.isoformat(), 'uploaded': x.bytes_uploaded,
+                 'downloaded': x.bytes_downloaded, 'active': x.active_connections}
+                for x in reversed(rows)]
 
     def event(self, category: str, message: str):
         with self.session() as s:

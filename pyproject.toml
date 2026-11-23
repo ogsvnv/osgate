@@ -3,7 +3,7 @@ requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "osgate"
-version = "0.1.0"
+version = "1.0.0"
 description = "Authenticated SOCKS5 gateway over persistent SSH transports"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -17,6 +17,7 @@ osgate = "osgate.cli:main"
 include = ["osgate*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 [tool.ruff]
 target-version = "py312"
 line-length = 100

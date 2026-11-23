@@ -28,8 +28,9 @@ TEMPLATE = Environment(loader=BaseLoader(), autoescape=select_autoescape(default
 
 
 def page(request: Request, title: str, body: str, error=None):
-    return HTMLResponse(TEMPLATE.render(title=title, body=body, logged_in='admin' in request.session,
-                        csrf=csrf(request), error=error))
+    return HTMLResponse(TEMPLATE.render(title=title, body=body,
+                        logged_in='admin' in request.session, csrf=csrf(request), error=error),
+                        headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
 
 
 def csrf(request):
@@ -52,6 +53,8 @@ async def form_data(request):
 def require_admin(request):
     if 'admin' not in request.session:
         raise HTTPException(401, 'Authentication required')
+    if request.session.get('auth_generation') != request.app.state.runtime.db.auth_generation():
+        raise HTTPException(401, 'Session expired')
 
 
 def check_csrf(request, form):
@@ -97,8 +100,10 @@ def register_routes(app, runtime):
 
     @app.get('/login')
     async def login_form(request: Request):
-        if request.session.get('admin'):
+        if (request.session.get('admin') and
+                request.session.get('auth_generation') == db.auth_generation()):
             return return_to('/')
+        request.session.clear()
         body = (f'<section><form method="post" action="/login" class="stack">{control(request)}'
                 '<label>Логин <input name="username" required autocomplete="username"></label>'
                 '<label>Пароль <input type="password" name="password" required autocomplete="current-password"></label>'
@@ -118,6 +123,7 @@ def register_routes(app, runtime):
         if await asyncio.to_thread(db.verify_admin, data.get('username', ''), data.get('password', '')):
             request.session.clear()  # rotate session, prevent fixation
             request.session['admin'] = data['username']
+            request.session['auth_generation'] = db.auth_generation()
             request.session['csrf'] = secrets.token_urlsafe(32)
             attempts.clear()
             await asyncio.to_thread(db.audit, data['username'], 'login', ip)
@@ -138,16 +144,42 @@ def register_routes(app, runtime):
         require_admin(request)
         servers = ssh.candidates()
         online = sum(s['ready'] for s in servers)
+        up, down = await asyncio.to_thread(db.traffic_totals)
+        uptime = max(0, int(asyncio.get_running_loop().time() - runtime.started_at))
         items = [('Состояние', 'ONLINE' if online else 'NO SSH'),
                  ('SOCKS5', 'RUNNING' if socks.server else 'STOPPED'),
                  ('SSH ONLINE', f'{online} / {len(servers)}'),
                  ('Активные соединения', len(socks.active)),
-                 ('Завершено', socks.completed), ('Ошибки SOCKS', socks.rejected)]
+                 ('Завершено', socks.completed), ('Ошибки SOCKS', socks.rejected),
+                 ('Клиентов онлайн', sum(count > 0 for count in socks.counts.values())),
+                 ('Отправлено, байт', up + sum(t.uploaded for t in socks.active.values())),
+                 ('Получено, байт', down + sum(t.downloaded for t in socks.active.values())),
+                 ('Uptime, сек', uptime),
+                 ('Последний failover', socks.router.last_failover or '—')]
         body = '<div class="grid">' + ''.join(f'<div class="card"><small>{safe(k)}</small><h2>{safe(v)}</h2></div>' for k, v in items) + '</div>'
-        body += '<section><h2>Состояние SSH</h2><table><tr><th>Имя</th><th>Состояние</th><th>Каналы</th><th>Задержка</th></tr>'
+        body += '<section><h2>Состояние SSH</h2><table id="ssh-status-table"><tr><th>Имя</th><th>Состояние</th><th>Каналы</th><th>Задержка</th></tr>'
         for s in servers:
             body += f'<tr><td>{safe(s["name"])}</td><td class="status {safe(s["status"])}">{safe(s["status"])}</td><td>{s["active_channels"]}</td><td>{safe(s["latency_ms"])} мс</td></tr>'
-        return page(request, 'Панель управления', body + '</table></section><script>setTimeout(()=>location.reload(),15000)</script>')
+        body += """</table></section><section><a href="/metrics">Графики трафика</a></section>
+<script>
+async function updateDashboard(){try{
+ const [a,b]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/metrics',{cache:'no-store'})]);
+ if(!a.ok||!b.ok)return;
+ const s=await a.json(),m=await b.json();
+ const values=[s.ssh_servers.some(x=>x.ready)?'ONLINE':'NO SSH',s.socks_running?'RUNNING':'STOPPED',
+ s.ssh_servers.filter(x=>x.ready).length+' / '+s.ssh_servers.length,
+ s.active_connections,s.completed_connections,s.rejected_connections,s.active_clients,
+ m.uploaded,m.downloaded,s.uptime_seconds,s.last_failover||'—'];
+ document.querySelectorAll('.grid .card h2').forEach((x,i)=>{if(i<values.length)x.textContent=values[i]});
+ const rows=document.getElementById('ssh-status-table').querySelectorAll('tr');
+ s.ssh_servers.forEach((x,i)=>{if(!rows[i+1])return;
+ const cells=rows[i+1].querySelectorAll('td');if(cells.length<4)return;
+ cells[1].textContent=x.status;cells[1].className='status '+x.status;
+ cells[2].textContent=x.active_channels;cells[3].textContent=x.latency_ms??'—';});
+}catch(_){}}
+setInterval(updateDashboard,5000);
+</script>"""
+        return page(request, 'Панель управления', body)
 
     @app.get('/servers')
     async def server_list(request: Request):
@@ -157,7 +189,8 @@ def register_routes(app, runtime):
         for rec in await asyncio.to_thread(db.servers):
             state = states.get(rec['id'], {})
             rows += f'<tr><td>{safe(rec["name"])}</td><td>{safe(rec["host"])}:{rec["port"]}</td><td>{rec["priority"]}</td><td>{rec["weight"]}</td><td class="status {safe(state.get("status", "DISABLED"))}">{safe(state.get("status", "DISABLED"))}</td>'
-            rows += (f'<td><form class="inline" method="post" action="/servers/{rec["id"]}/toggle">{control(request)}<button>{"Отключить" if rec["enabled"] else "Включить"}</button></form>'
+            rows += (f'<td><a href="/servers/{rec["id"]}/edit">Изменить / проверить</a> '
+                     f'<form class="inline" method="post" action="/servers/{rec["id"]}/toggle">{control(request)}<button>{"Отключить" if rec["enabled"] else "Включить"}</button></form>'
                      f'<form class="inline" method="post" action="/servers/{rec["id"]}/delete">{control(request)}<button class="danger">Удалить</button></form></td></tr>')
         rows += '</table></section><section><h2>Добавить SSH-сервер</h2><p class="muted">Ключ и known_hosts сначала разместите в защищённом SSH_DIRECTORY. Fingerprint должен быть подтверждён отдельно.</p>'
         rows += f'<form method="post" action="/servers/new">{control(request)}'
@@ -233,6 +266,7 @@ def register_routes(app, runtime):
             for x in users:
                 rows += (f'<tr><td>{safe(x.name)}</td><td>{safe(x.username)}</td><td>{"ACTIVE" if x.enabled else "BLOCKED"}</td>'
                          f'<td>{socks.counts.get(x.id,0)} / {x.max_connections}</td><td>{x.bytes_uploaded} / {x.bytes_downloaded}</td><td>'
+                         f'<a href="/clients/{x.id}/edit">Редактировать / пароль</a> '
                          f'<form class="inline" method="post" action="/clients/{x.id}/toggle">{control(request)}<button>{"Заблокировать" if x.enabled else "Разблокировать"}</button></form>'
                          f'<form class="inline" method="post" action="/clients/{x.id}/delete">{control(request)}<button class="danger">Удалить</button></form></td></tr>')
         rows += '</table></section><section><h2>Новый SOCKS5-клиент</h2>'
@@ -268,6 +302,10 @@ def register_routes(app, runtime):
             user = s.get(Client, client_id)
             if not user: raise HTTPException(404)
             user.enabled = not user.enabled
+        if not user.enabled:
+            for tunnel in list(socks.active.values()):
+                if tunnel.client_id == client_id:
+                    await socks.disconnect(tunnel.id)
         await asyncio.to_thread(db.audit, request.session['admin'], 'client_toggle', str(client_id))
         return return_to('/clients')
 
@@ -301,6 +339,12 @@ def register_routes(app, runtime):
         if data.get('mode') not in MODES:
             raise HTTPException(400, 'Unsupported routing mode')
         mid = int(data['manual_server_id']) if data.get('manual_server_id') else None
+        try:
+            delay = float(data.get('failback_delay', '60'))
+            if not 0 <= delay <= 3600:
+                raise ValueError
+        except ValueError as exc:
+            raise HTTPException(400, 'Invalid failback delay') from exc
         with db.session() as s:
             if data['mode'] == 'manual' and (not mid or not s.get(SSHServer, mid)):
                 raise HTTPException(400, 'Manual SSH server required')
@@ -308,6 +352,7 @@ def register_routes(app, runtime):
             route.mode = data['mode']
             route.manual_server_id = mid
             route.auto_failback = data.get('auto_failback') == 'yes'
+        await asyncio.to_thread(db.set_setting, 'failback_delay', str(delay))
         await asyncio.to_thread(db.audit, request.session['admin'], 'routing_change', data['mode'])
         return return_to('/routing')
 
@@ -340,7 +385,8 @@ def register_routes(app, runtime):
         body += '</table></section><section><h2>Аудит администратора</h2><table>'
         for x in audits:
             body += f'<tr><td>{safe(x.when)}</td><td>{safe(x.actor)}</td><td>{safe(x.action)}</td><td>{safe(x.detail)}</td></tr>'
-        return page(request, 'Журнал событий', body + '</table></section>')
+        body += '</table></section><section><a href="/api/diagnostics">Диагностика JSON</a> · <a href="/api/events.csv">Экспорт CSV</a></section>'
+        return page(request, 'Журнал событий', body)
 
     @app.get('/settings')
     async def settings_page(request: Request):
@@ -350,11 +396,24 @@ def register_routes(app, runtime):
                 f'<p>SOCKS5: <code>{safe(config.socks_host)}:{config.socks_port}</code></p>'
                 f'<p>Проверка SSH каждые {config.health_check_interval} с</p>'
                 '<p>Чувствительные параметры не отображаются.</p></section>')
+        body += '<section><a href="/admin/password">Смена пароля администратора</a> · <a href="/settings/runtime">Параметры работы</a> · <a href="/metrics">Графики</a></section>'
         return page(request, 'Настройки', body)
 
     @app.get('/api/status')
     async def api_status(request: Request):
         require_admin(request)
-        return {'ssh_servers': ssh.candidates(), 'active_connections': len(socks.active),
-                'socks_running': socks.server is not None,
-                'completed_connections': socks.completed, 'rejected_connections': socks.rejected}
+        public = ('id', 'name', 'status', 'ready', 'active_channels', 'latency_ms',
+                  'reconnect_count', 'last_error')
+        return JSONResponse({
+            'ssh_servers': [{k: item[k] for k in public} for item in ssh.candidates()],
+            'active_connections': len(socks.active),
+            'active_clients': sum(count > 0 for count in socks.counts.values()),
+            'uptime_seconds': max(0, int(asyncio.get_running_loop().time() - runtime.started_at)),
+            'last_failover': socks.router.last_failover,
+            'socks_running': socks.server is not None,
+            'completed_connections': socks.completed,
+            'rejected_connections': socks.rejected,
+        }, headers={'Cache-Control': 'no-store'})
+
+    from .web_v1 import register_v1_routes
+    register_v1_routes(app, runtime)
