@@ -17,13 +17,15 @@ class EnrollmentError(Exception):
     """Safe, client-visible SSH enrollment failure."""
 
 
-def credential_path(raw: str, directory: Path) -> Path:
-    """Use only existing regular files in the configured SSH_DIRECTORY."""
+def credential_path(raw: str, directory: Path, other_directory: Path | None = None) -> Path:
+    """Restrict SSH credentials to configured trusted directories."""
     try:
-        base = directory.resolve(strict=True)
+        roots = [directory.resolve(strict=True)]
+        if other_directory is not None and other_directory.is_dir():
+            roots.append(other_directory.resolve(strict=True))
         path = Path(raw).resolve(strict=True)
-        if not path.is_relative_to(base) or not path.is_file():
-            raise EnrollmentError("SSH-ключ и known_hosts должны находиться в SSH_DIRECTORY.")
+        if not any(path.is_relative_to(root) for root in roots) or not path.is_file():
+            raise EnrollmentError("SSH-файл вне разрешённого каталога.")
     except (OSError, ValueError) as exc:
         raise EnrollmentError("SSH-ключ или known_hosts не найден.") from exc
     return path
@@ -75,7 +77,9 @@ async def enroll_public_key(record: dict, settings, password: str):
     if not isinstance(password, str) or not password or len(password) > 1024:
         raise EnrollmentError("Введите пароль пользователя SSH.")
     key = credential_path(record["key_file"], settings.ssh_directory)
-    known_hosts = credential_path(record["known_hosts_file"], settings.ssh_directory)
+    known_hosts = credential_path(
+        record["known_hosts_file"], settings.ssh_directory,
+        getattr(settings, "ssh_hostkeys_directory", None))
     public_key = await asyncio.to_thread(derive_public_key, key)
     conn = None
     try:

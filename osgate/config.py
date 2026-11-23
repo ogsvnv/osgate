@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     health_test_port: int = Field(default=443, ge=1, le=65535)
     database_url: str = 'sqlite:////data/osgate.db'
     ssh_directory: Path = Path('/ssh')
+    ssh_hostkeys_directory: Path = Path('/data/ssh-hostkeys')
     telegram_enabled: bool = False
     telegram_bot_token: str = ''
     telegram_chat_id: str = ''

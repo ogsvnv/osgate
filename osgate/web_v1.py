@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from .database import Admin, Client, SSHServer, Event, hasher
 from .ssh import connect_ssh
+from .hostkey_trust import HostKeyError, preview_host_key, verify_and_stage
 from .ssh_onboarding import EnrollmentError, enroll_public_key
 from .web import check_csrf, control, esc_input, form_data, page, require_admin, return_to, safe
 
@@ -69,9 +70,97 @@ def register_v1_routes(app, runtime):
                               ('primary', 'Сделать основным')):
             body += '<form method="post" action="/servers/%d/%s">%s<button>%s</button></form>' % (
                 server_id, action, control(request), title)
-        body += (f'<p><a href="/servers/{server_id}/onboard">'
+        body += (f'<p><a href="/servers/{server_id}/hostkey">'
+                 'Проверить и подтвердить ключ SSH-сервера</a> · '
+                 f'<a href="/servers/{server_id}/onboard">'
                  'Настроить SSH-доступ (установить публичный ключ)</a></p>')
         return page(request, 'SSH-сервер — редактирование', body + '</section>')
+
+    @app.get('/servers/{server_id}/hostkey')
+    async def server_hostkey_preview(request: Request, server_id: int):
+        require_admin(request)
+        with db.session() as session:
+            item = session.get(SSHServer, server_id)
+            if item is None:
+                raise HTTPException(404)
+            record = {k: getattr(item, k) for k in (
+                'name', 'host', 'port', 'username', 'known_hosts_file')}
+        try:
+            _, fingerprint = await preview_host_key(
+                record['host'], record['port'], cfg.ssh_connect_timeout)
+        except HostKeyError as exc:
+            return page(request, 'SSH host key: проверка недоступна',
+                        '<section><p>' + safe(exc) + '</p></section>')
+        body = ('<section><h2>Непроверенный ключ SSH-сервера</h2>'
+                '<p>Ключ получен по сети и ПОКА НЕ ЯВЛЯЕТСЯ ДОВЕРЕННЫМ. '
+                'Сверьте отпечаток с консолью SSH-сервера или другим '
+                'доверенным каналом. Не подтверждайте ключ, только потому '
+                'что он показан на этой странице.</p>')
+        body += (f'<p>Сервер: <b>{safe(record["name"])}</b>, '
+                 f'{safe(record["host"])}:{record["port"]}</p>')
+        body += '<p>SHA256 fingerprint: <code>' + safe(fingerprint) + '</code></p>'
+        body += ('<p>После независимой проверки введите ТОЧНО такой же '
+                 'отпечаток для разрешения подключения.</p>')
+        body += f'<form method="post" action="/servers/{server_id}/hostkey">'
+        body += control(request)
+        body += ('<label>Подтверждённый SHA256-отпечаток '
+                 '<input type="text" name="verified_fingerprint" '
+                 'autocomplete="off" required size="58"></label>')
+        body += ('<label><input type="checkbox" name="confirmed" value="yes" '
+                 'required>Сверил отпечаток через доверенный канал и '
+                 'разрешаю доверять этому SSH-серверу</label>')
+        body += '<button>Принять ключ и проверить подключение</button></form></section>'
+        return page(request, 'Проверка ключа SSH-сервера', body)
+
+    @app.post('/servers/{server_id}/hostkey')
+    async def server_hostkey_accept(request: Request, server_id: int):
+        require_admin(request)
+        data = await form_data(request)
+        check_csrf(request, data)
+        if data.get('confirmed') != 'yes':
+            raise HTTPException(400, 'Подтвердите независимую проверку отпечатка.')
+        with db.session() as session:
+            item = session.get(SSHServer, server_id)
+            if item is None:
+                raise HTTPException(404)
+            record = {k: getattr(item, k) for k in (
+                'host', 'port', 'name', 'username', 'key_file', 'known_hosts_file')}
+        try:
+            trust = await verify_and_stage(
+                record['host'], record['port'],
+                data.get('verified_fingerprint', ''), cfg)
+        except HostKeyError as exc:
+            return page(request, 'SSH host key не принят',
+                        '<section><p>' + safe(exc) +
+                        '</p><a href="/servers">Назад</a></section>')
+        try:
+            record['known_hosts_file'] = str(trust)
+            with db.session() as session:
+                item = session.get(SSHServer, server_id)
+                if (item is None or item.host != record['host']
+                        or item.port != record['port']):
+                    raise HTTPException(409, 'Настройки сервера изменились. Повторите проверку.')
+                item.known_hosts_file = str(trust)
+        except Exception:
+            trust.unlink(missing_ok=True)
+            raise
+        await asyncio.to_thread(db.audit, request.session['admin'],
+                                'ssh_hostkey_approved', str(server_id))
+        await ssh.refresh()
+        try:
+            await probe_ssh(record, cfg)
+        except Exception as exc:
+            # The host key is trusted, but authentication or TCP forwarding
+            # may still fail independently. Do not roll back independent trust.
+            return page(request, 'Ключ SSH-сервера подтверждён',
+                        '<section><p>Host key сохранён, но SSH или TCP '
+                        'forwarding ещё не работают: ' + safe(type(exc).__name__) +
+                        '.</p><p>Проверьте авторизацию SSH-пользователя.</p>'
+                        f'<a href="/servers/{server_id}/onboard">'
+                        'Установить публичный ключ пользователя</a></section>')
+        return page(request, 'Ключ SSH-сервера подтверждён',
+                    '<section><p>Host key сохранён. SSH и TCP forwarding '
+                    'успешно проверены.</p><a href="/servers">К серверам</a></section>')
 
     @app.get('/servers/{server_id}/onboard')
     async def server_onboarding_form(request: Request, server_id: int):
