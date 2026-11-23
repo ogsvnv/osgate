@@ -15,6 +15,7 @@ from .database import Admin, Client, SSHServer, Routing, Event, Audit, hasher
 from .routing import MODES
 from .ssh import connect_ssh
 from .dashboard_charts import DASHBOARD_CHARTS_HTML, DASHBOARD_CHARTS_CSS, DASHBOARD_CHARTS_JS
+from .traffic_format import human_bytes, human_uptime
 from .hostkey_trust import HostKeyError, preview_host_key, verify_and_stage
 
 TEMPLATE = Environment(loader=BaseLoader(), autoescape=select_autoescape(default=True)).from_string('''
@@ -154,9 +155,9 @@ def register_routes(app, runtime):
                  ('Активные соединения', len(socks.active)),
                  ('Завершено', socks.completed), ('Ошибки SOCKS', socks.rejected),
                  ('Клиентов онлайн', sum(count > 0 for count in socks.counts.values())),
-                 ('Отправлено, байт', up + sum(t.uploaded for t in socks.active.values())),
-                 ('Получено, байт', down + sum(t.downloaded for t in socks.active.values())),
-                 ('Uptime, сек', uptime),
+                 ('Отправлено', human_bytes(up + sum(t.uploaded for t in socks.active.values()))),
+                 ('Получено', human_bytes(down + sum(t.downloaded for t in socks.active.values()))),
+                 ('Время работы', human_uptime(uptime)),
                  ('Последний failover', datetime.fromtimestamp(socks.router.last_failover, timezone.utc).strftime('%d.%m.%Y %H:%M:%S UTC') if socks.router.last_failover else '—')]
         body = '<div class="grid">' + ''.join(f'<div class="card"><small>{safe(k)}</small><h2>{safe(v)}</h2></div>' for k, v in items) + '</div>'
         body += '<style>' + DASHBOARD_CHARTS_CSS + '</style>' + DASHBOARD_CHARTS_HTML
@@ -225,6 +226,30 @@ def register_routes(app, runtime):
             body += f'<tr><td>{safe(s["name"])}</td><td class="status {safe(s["status"])}">{safe(s["status"])}</td><td>{s["active_channels"]}</td><td>{safe(s["latency_ms"])} мс</td></tr>'
         body += """</table></section><section><a href="/metrics">Графики трафика</a></section>
 <script>
+function humanBytes(value){
+ const n=Math.max(0,Number(value));
+ if(!Number.isFinite(n))return '—';
+ const units=['Б','КБ','МБ','ГБ','ТБ'];
+ let x=n,i=0;
+ while(x>=1024&&i<units.length-1){x/=1024;i++}
+ const precision=i===0||x>=100?0:1;
+ return x.toLocaleString('ru-RU',{minimumFractionDigits:precision,
+   maximumFractionDigits:precision})+' '+units[i];
+}
+function humanUptime(seconds){
+ const n=Number(seconds);
+ if(!Number.isFinite(n))return '—';
+ let remaining=Math.max(0,Math.floor(n));
+ const days=Math.floor(remaining/86400);remaining%=86400;
+ const hours=Math.floor(remaining/3600);remaining%=3600;
+ const minutes=Math.floor(remaining/60),secs=remaining%60;
+ const parts=[];
+ if(days)parts.push(days+' дн.');
+ if(hours)parts.push(hours+' ч');
+ if(minutes)parts.push(minutes+' мин');
+ if(!parts.length || (!days&&!hours))parts.push(secs+' сек');
+ return parts.join(' ');
+}
 async function updateDashboard(){try{
  const [a,b,c]=await Promise.all([fetch('/api/status',{cache:'no-store'}),fetch('/api/metrics',{cache:'no-store'}),fetch('/api/ssh-latency',{cache:'no-store'})]);
  if(!a.ok||!b.ok)return;
@@ -234,7 +259,7 @@ async function updateDashboard(){try{
  const values=[s.ssh_servers.some(x=>x.ready)?'ONLINE':'NO SSH',s.socks_running?'RUNNING':'STOPPED',
  s.ssh_servers.filter(x=>x.ready).length+' / '+s.ssh_servers.length,
  s.active_connections,s.completed_connections,s.rejected_connections,s.active_clients,
- m.uploaded,m.downloaded,s.uptime_seconds,s.last_failover?new Date(s.last_failover*1000).toLocaleString('ru-RU'):'—'];
+ humanBytes(m.uploaded),humanBytes(m.downloaded),humanUptime(s.uptime_seconds),s.last_failover?new Date(s.last_failover*1000).toLocaleString('ru-RU'):'—'];
  document.querySelectorAll('.grid .card h2').forEach((x,i)=>{if(i<values.length)x.textContent=values[i]});
  const rows=document.getElementById('ssh-status-table').querySelectorAll('tr');
  s.ssh_servers.forEach((x,i)=>{if(!rows[i+1])return;
