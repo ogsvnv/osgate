@@ -13,13 +13,14 @@ async def connect_ssh(record: dict, settings):
     """Import at use-time to keep pure protocol tests independent of SSH library."""
     import asyncssh
     ssh_dir = settings.ssh_directory.resolve()
-    def validate_path(raw):
+    hostkey_dir = settings.ssh_hostkeys_directory.resolve()
+    def validate_path(raw, allowed):
         path = Path(raw).resolve(strict=True)
-        if not path.is_relative_to(ssh_dir) or not path.is_file():
-            raise ValueError('SSH credential path must be a file inside SSH_DIRECTORY')
+        if not any(path.is_relative_to(root) for root in allowed) or not path.is_file():
+            raise ValueError('SSH credential path outside allowed directories')
         return str(path)
-    key = validate_path(record['key_file'])
-    known_hosts = validate_path(record['known_hosts_file'])
+    key = validate_path(record['key_file'], (ssh_dir,))
+    known_hosts = validate_path(record['known_hosts_file'], (ssh_dir, hostkey_dir))
     # AsyncSSH validates the server's public key against known_hosts, no TOFU bypass.
     return await asyncssh.connect(
         record['host'], port=record['port'], username=record['username'],

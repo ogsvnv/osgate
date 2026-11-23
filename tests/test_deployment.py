@@ -43,3 +43,14 @@ def test_systemd_installer_syntax_and_venv_preflight():
     assert "ensurepip missing" in script
     assert "systemctl daemon-reload" in script
     assert "Firewall ports were not modified." in script
+
+
+
+def test_systemd_hostkeys_store_is_writable_and_persistent():
+    installer = (ROOT / 'deploy/install.sh').read_text()
+    unit = (ROOT / 'deploy/systemd/osgate.service').read_text()
+    assert 'SSH_HOSTKEYS_DIRECTORY=/var/lib/osgate/ssh-hostkeys' in installer
+    assert 'grep -q' in installer
+    assert 'ReadWritePaths=/var/lib/osgate' in unit
+    env = (ROOT / '.env.example').read_text()
+    assert 'SSH_HOSTKEYS_DIRECTORY=/data/ssh-hostkeys' in env

@@ -14,6 +14,7 @@ from sqlalchemy import select, desc
 from .database import Admin, Client, SSHServer, Routing, Event, Audit, hasher
 from .routing import MODES
 from .ssh import connect_ssh
+from .hostkey_trust import HostKeyError, preview_host_key, verify_and_stage
 
 TEMPLATE = Environment(loader=BaseLoader(), autoescape=select_autoescape(default=True)).from_string('''
 <!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -202,6 +203,38 @@ setInterval(updateDashboard,5000);
         rows += f'<form method="post" action="/servers/new">{control(request)}'
         for name, value, typ in [('name','','text'),('host','','text'),('port',22,'number'),('username','','text'),('key_file','/ssh/id_ed25519','text'),('known_hosts_file','/ssh/known_hosts','text'),('priority',100,'number'),('weight',1,'number')]:
             rows += esc_input(name, value, typ, True)
+        rows += ('<section><h3>Подлинность SSH-сервера</h3>'
+                 '<p>Если сервер ещё не содержится в known_hosts, сначала '
+                 'получите его SHA256-отпечаток. Сверьте его с отпечатком '
+                 'на консоли сервера или через другой доверенный канал. '
+                 'Это не автоматическое доверие!</p>'
+                 '<button type="button" id="hostkey-preview">'
+                 'Показать SHA256-отпечаток</button>'
+                 '<p id="hostkey-result"></p>'
+                 '<label>Подтверждённый SHA256 fingerprint '
+                 '<input name="verified_fingerprint" type="text" '
+                 'autocomplete="off" size="58" placeholder="SHA256:..."></label>'
+                 '<label><input name="confirm_hostkey" type="checkbox" value="yes">'
+                 'Сверил fingerprint через независимый доверенный канал '
+                 'и разрешаю сохранить ключ сервера</label></section>')
+        rows += ('''<script>
+        document.getElementById('hostkey-preview').onclick=async function(){
+          const form=this.closest('form'), msg=document.getElementById('hostkey-result');
+          msg.textContent='Получение ключа (он пока НЕ доверен)...';
+          try {
+            const params=new URLSearchParams();
+            params.set('csrf',form.querySelector('[name=csrf]').value);
+            params.set('host',form.querySelector('[name=host]').value);
+            params.set('port',form.querySelector('[name=port]').value);
+            const response=await fetch('/api/ssh/hostkey-preview',{
+              method:'POST',body:params,headers:{'Content-Type':'application/x-www-form-urlencoded'}});
+            if(!response.ok){msg.textContent='Не удалось получить ключ. Проверьте host и порт.';return}
+            const data=await response.json();
+            msg.textContent='НЕПРОВЕРЕННЫЙ SHA256: '+data.fingerprint
+               +' — сверить независимо и вручную ввести в поле подтверждения.';
+          } catch(_){msg.textContent='Ошибка запроса SSH host key.'}
+        };
+        </script>''')
         rows += ('<label><input type="checkbox" name="install_key" value="yes">'
                  'Настроить SSH-доступ через пароль при добавлении</label>')
         rows += ('<label>Пароль SSH (только для первоначальной настройки) '
@@ -212,11 +245,28 @@ setInterval(updateDashboard,5000);
         rows += '<button>Добавить</button></form></section>'
         return page(request, 'SSH-серверы', rows)
 
+    @app.post('/api/ssh/hostkey-preview')
+    async def hostkey_preview_api(request: Request):
+        require_admin(request)
+        data = await form_data(request)
+        check_csrf(request, data)
+        try:
+            host = data.get('host', '')
+            port = int(data.get('port', '22'))
+            _, fingerprint = await preview_host_key(
+                host, port, config.ssh_connect_timeout)
+        except (ValueError, HostKeyError) as exc:
+            raise HTTPException(400, 'Не удалось получить SSH host key') from exc
+        return JSONResponse({'fingerprint': fingerprint},
+                            headers={'Cache-Control': 'no-store'})
+
     @app.post('/servers/new')
     async def new_server(request: Request):
         require_admin(request)
         data = await form_data(request)
         check_csrf(request, data)
+        staged = None
+        persisted = False
         try:
             record = dict(name=data['name'].strip()[:120], host=data['host'].strip()[:255],
                           port=int(data['port']), username=data['username'].strip()[:120],
@@ -225,6 +275,15 @@ setInterval(updateDashboard,5000);
             if not (record['name'] and record['host'] and record['username'] and
                     1 <= record['port'] <= 65535 and 1 <= record['weight'] <= 1000):
                 raise ValueError('Invalid fields')
+            # One-time trust is accepted ONLY when fingerprint was checked
+            # against an independent trusted source and entered explicitly.
+            if data.get('confirm_hostkey') == 'yes':
+                staged = await verify_and_stage(
+                    record['host'], record['port'],
+                    data.get('verified_fingerprint', ''), config)
+                record['known_hosts_file'] = str(staged)
+            elif data.get('verified_fingerprint'):
+                raise HTTPException(400, 'Требуется подтверждение SSH host key.')
             # Optional one-time enrollment precedes normal SSH/TCP forwarding
             # verification and never persists the supplied SSH password.
             if data.get('install_key') == 'yes':
@@ -249,18 +308,27 @@ setInterval(updateDashboard,5000);
                 await conn.wait_closed()
             with db.session() as s:
                 s.add(SSHServer(**record))
+            persisted = True  # After commit, the trusted hostkey path must remain valid.
             await asyncio.to_thread(db.audit, request.session['admin'], 'server_add', record['name'])
             await ssh.refresh()
         except HTTPException:
+            if staged is not None and not persisted:
+                staged.unlink(missing_ok=True)
             raise
         except Exception as exc:
+            if staged is not None and not persisted:
+                staged.unlink(missing_ok=True)
             from .ssh_onboarding import EnrollmentError
             if isinstance(exc, EnrollmentError):
                 reason = safe(str(exc))
             else:
                 reason = safe(type(exc).__name__)
             return page(request, 'Ошибка добавления сервера',
-                        '<p>Конфигурация не сохранена.</p><a href="/servers">Назад</a>',
+                        '<p>Конфигурация не сохранена.</p>'
+                        '<p>При HostKeyNotVerifiable используйте кнопку '
+                        '«Показать SHA256-отпечаток» и подтвердите его '
+                        'после независимой проверки.</p>'
+                        '<a href="/servers">Назад</a>',
                         reason)
         return return_to('/servers')
 

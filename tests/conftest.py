@@ -8,6 +8,7 @@ def setup(tmp_path):
     cfg = Settings(session_secret='a' * 64,
                    database_url='sqlite:///' + str(tmp_path / 'osgate.db'),
                    ssh_directory=tmp_path,
+                   ssh_hostkeys_directory=tmp_path / 'ssh-hostkeys',
                    socks_host='127.0.0.1', socks_port=1080,
                    health_check_interval=0.5, health_check_timeout=1,
                    health_success_threshold=1, health_failure_threshold=1,

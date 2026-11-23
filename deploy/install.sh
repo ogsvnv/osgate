@@ -26,10 +26,15 @@ if [[ ! -f /etc/osgate/osgate.env ]]; then
   install -m 0640 -o root -g osgate /opt/osgate/.env.example /etc/osgate/osgate.env
   sed -i 's|DATABASE_URL=sqlite:////data/osgate.db|DATABASE_URL=sqlite:////var/lib/osgate/osgate.db|' /etc/osgate/osgate.env
   sed -i 's|SSH_DIRECTORY=/ssh|SSH_DIRECTORY=/etc/osgate/ssh|' /etc/osgate/osgate.env
+  sed -i 's|SSH_HOSTKEYS_DIRECTORY=/data/ssh-hostkeys|SSH_HOSTKEYS_DIRECTORY=/var/lib/osgate/ssh-hostkeys|' /etc/osgate/osgate.env
   sed -i 's|WEB_HOST=0.0.0.0|WEB_HOST=127.0.0.1|' /etc/osgate/osgate.env
   sed -i 's|SOCKS_HOST=0.0.0.0|SOCKS_HOST=127.0.0.1|' /etc/osgate/osgate.env
   secret=$(openssl rand -hex 32)
   sed -i "s|SESSION_SECRET=.*|SESSION_SECRET=$secret|" /etc/osgate/osgate.env
+fi
+# Keep older systemd installs compatible without replacing user-owned settings.
+if ! grep -q '^SSH_HOSTKEYS_DIRECTORY=' /etc/osgate/osgate.env; then
+  printf '\nSSH_HOSTKEYS_DIRECTORY=/var/lib/osgate/ssh-hostkeys\n' >> /etc/osgate/osgate.env
 fi
 install -m 0644 /opt/osgate/deploy/systemd/osgate.service /etc/systemd/system/osgate.service
 systemctl daemon-reload
