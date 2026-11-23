@@ -1,8 +1,9 @@
 """Deterministic candidate selection. Never uses a local network path."""
 import itertools
+import math
 import time
 
-MODES = {'failover', 'round_robin', 'weighted_round_robin', 'manual', 'sticky'}
+MODES = {'failover', 'round_robin', 'weighted_round_robin', 'manual', 'sticky', 'min_rtt'}
 
 
 class Router:
@@ -27,6 +28,22 @@ class Router:
             return [x for x in ready if x['id'] == settings.get('manual_server_id')]
         if not ready:
             return []
+        if mode == 'min_rtt':
+            # RTT here is the latency of the existing forwarded TCP health probe,
+            # not ICMP ping. Never issue a network probe during SOCKS routing.
+            # Missing, negative, NaN or infinite values have the lowest preference.
+            # Priority and ID are deterministic tie-breakers.
+            def latency(candidate):
+                raw = candidate.get('latency_ms')
+                if raw is None or isinstance(raw, bool):
+                    return math.inf
+                try:
+                    measured = float(raw)
+                except (TypeError, ValueError, OverflowError):
+                    return math.inf
+                return measured if math.isfinite(measured) and measured >= 0 else math.inf
+            return sorted(ready, key=lambda item: (
+                latency(item), item['priority'], item['id']))
         if mode == 'failover':
             chosen = ready[0]
             if self._selected_failover_id is not None:
