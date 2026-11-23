@@ -451,6 +451,18 @@ def backup_database(source: Path, output_dir: Path):
     info(f"Резервная копия SQLite: {dest}")
 
 
+def pull_source():
+    """Fetch new files as the checkout owner, never as root in another user's tree."""
+    if not (ROOT / ".git").is_dir():
+        raise InstallError("Для обновления нужен Git-клон репозитория OSGate.")
+    owner = pwd.getpwuid(ROOT.stat().st_uid).pw_name
+    args = ["git", "-C", str(ROOT), "pull", "--ff-only"]
+    if os.geteuid() == 0 and owner != "root":
+        require_commands("runuser")
+        args = ["runuser", "-u", owner, "--", *args]
+    return run(*args)
+
+
 def update(mode: str):
     require_root()
     section(f"Обновление · {mode}")
@@ -461,7 +473,7 @@ def update(mode: str):
         if not (ROOT / ".env").exists():
             raise InstallError("Не найдена .env, сначала установите приложение.")
         backup_database(ROOT / "data" / "osgate.db", ROOT / "backups")
-        run("git", "-C", str(ROOT), "pull", "--ff-only")
+        pull_source()
         docker("up", "-d", "--build")
         info("Контейнер обновлён; .env, SSH-ключи и база не перезаписаны.")
     else:
@@ -469,7 +481,7 @@ def update(mode: str):
         if not SYSTEM_ENV.exists() or not SYSTEM_ROOT.exists():
             raise InstallError("Служба ещё не установлена.")
         backup_database(Path("/var/lib/osgate/osgate.db"), ROOT / "backups")
-        run("git", "-C", str(ROOT), "pull", "--ff-only")
+        pull_source()
         copy_source(SYSTEM_ROOT, replacing=True)
         run("bash", str(SYSTEM_ROOT / "deploy" / "install.sh"))
         run("systemctl", "restart", "osgate")

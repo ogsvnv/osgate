@@ -143,3 +143,17 @@ def test_known_hosts_requires_positive_manual_verification(monkeypatch):
     monkeypatch.setattr(wizard, "ask", lambda *args, **kwargs: "НЕТ")
     with pytest.raises(wizard.InstallError, match="не подтверждён"):
         wizard.fetch_host_keys("park.example", 22)
+
+
+
+def test_pull_source_requires_checkout_and_uses_checkout_owner(tmp_path, monkeypatch):
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(wizard, "ROOT", tmp_path)
+    monkeypatch.setattr(wizard.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(wizard.pwd, "getpwuid", lambda uid: type("Owner", (), {"pw_name": "developer"})())
+    monkeypatch.setattr(wizard, "require_commands", lambda *args: None)
+    called = []
+    monkeypatch.setattr(wizard, "run", lambda *args: called.append(args))
+    wizard.pull_source()
+    assert called == [("runuser", "-u", "developer", "--", "git", "-C",
+                       str(tmp_path), "pull", "--ff-only")]
