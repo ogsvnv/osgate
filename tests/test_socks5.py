@@ -125,3 +125,88 @@ async def test_auth_method_must_be_username_password(setup):
         writer.close(); await writer.wait_closed()
     finally:
         await proxy.stop()
+
+
+@pytest.mark.asyncio
+async def test_stopping_proxy_closes_incomplete_handshakes(setup):
+    """Shutdown must not hang when clients leave SOCKS greetings unfinished."""
+    cfg, db = setup
+    cfg.socks_port = await free_port()
+    proxy = SocksServer(db, SSHManager(db, cfg), cfg)
+    await proxy.start()
+    reader, writer = await asyncio.open_connection('127.0.0.1', cfg.socks_port)
+    writer.write(b'\x05')
+    await writer.drain()
+    await asyncio.wait_for(proxy.stop(), 2)
+    try:
+        assert await asyncio.wait_for(reader.read(1), 2) == b''
+    except ConnectionResetError:
+        pass  # Shutdown may reset a client with a partially sent greeting.
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except ConnectionResetError:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_broken_ssh_releases_tunnel_and_cancels_sibling_pump(setup):
+    """Abrupt SSH loss must close client and free connection counters."""
+    cfg, db = setup
+    cfg.socks_port = await free_port()
+    cfg.health_check_interval = 0.05
+    closing = asyncio.Event()
+
+    async def breakable_target(reader, writer):
+        await closing.wait()
+        writer.close()
+        await writer.wait_closed()
+
+    target = await asyncio.start_server(breakable_target, '127.0.0.1', 0)
+    port = target.sockets[0].getsockname()[1]
+    fake = FakeSSHConnection(port)
+
+    async def connector(record, settings):
+        return fake
+
+    with db.session() as session:
+        session.add(SSHServer(name='test-breakage', host='ssh.example', port=22,
+                              username='tester', key_file='/ssh/key',
+                              known_hosts_file='/ssh/known_hosts'))
+    manager = SSHManager(db, cfg, connector=connector)
+    proxy = SocksServer(db, manager, cfg)
+    await manager.start()
+    await proxy.start()
+    writer = None
+    try:
+        for _ in range(100):
+            if any(s['ready'] for s in manager.candidates()):
+                break
+            await asyncio.sleep(0.01)
+        reader, writer = await asyncio.open_connection('127.0.0.1', cfg.socks_port)
+        assert await handshake(reader, writer) == b'\x01\x00'
+        assert (await connect_request(reader, writer))[1] == 0
+        for _ in range(100):
+            if proxy.active:
+                break
+            await asyncio.sleep(0.01)
+        assert len(proxy.active) == 1
+        # Simulate losing the SSH transport and its forwarded stream.
+        fake.close()
+        closing.set()
+        assert await asyncio.wait_for(reader.read(1), 2) == b''
+        for _ in range(100):
+            if not proxy.active and not any(proxy.counts.values()):
+                break
+            await asyncio.sleep(0.01)
+        assert not proxy.active
+        assert not any(proxy.counts.values())
+        assert all(s['active_channels'] == 0 for s in manager.candidates())
+    finally:
+        if writer:
+            writer.close()
+            await writer.wait_closed()
+        await proxy.stop()
+        await manager.stop()
+        target.close()
+        await target.wait_closed()
