@@ -8,6 +8,22 @@ OSGate — SOCKS5-шлюз, который открывает целевые TCP
 
 При потере соединения действующие TCP-сеансы завершаются. Новые используют резервный маршрут. При отсутствии исправного SSH возвращается ошибка SOCKS5, **никакого прямого подключения**. `socks5h://` передаёт домен на прокси, тогда как `socks5://` в curl может разрешить домен локально.
 
+## Мастер установки (рекомендуется)
+
+Для Ubuntu/Debian доступен интерактивный установщик с выбором Docker Compose или systemd,
+проверкой зависимостей, настройкой портов, SSH-ключей и созданием администратора:
+
+```bash
+git clone https://github.com/ogsvnv/osgate.git && cd osgate
+sudo ./install.sh
+```
+
+Просмотр состояния: `sudo ./install.sh --check --mode docker` или
+`sudo ./install.sh --check --mode systemd`.
+Обновление с сохранением настроек и резервной копией SQLite:
+`sudo ./install.sh --update --mode docker` (или `systemd`).
+Подробно: [docs/installer.md](docs/installer.md). Порты по умолчанию доступны только локально.
+
 ## Docker Compose
 
 1. `git clone https://github.com/ogsvnv/osgate.git && cd osgate`
