@@ -1,6 +1,7 @@
 """Application lifecycle, with independent SSH and HTTP/SOCKS listeners."""
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from starlette.middleware.sessions import SessionMiddleware
@@ -21,18 +22,36 @@ class Runtime:
         self.notifier = Notifier(settings)
         self.ssh = SSHManager(self.db, settings, notify=self.notifier.notify, connector=connector)
         self.socks = SocksServer(self.db, self.ssh, settings)
+        self._metrics_task = None
+        self.started_at = time.monotonic()
 
     async def start(self):
         await asyncio.to_thread(self.db.initialize)
+        from .settings_store import load_runtime_settings
+        await asyncio.to_thread(load_runtime_settings, self.db, self.settings)
         await self.ssh.start()
         try:
             await self.socks.start()
         except Exception:
             await self.ssh.stop()
             raise
+        self._metrics_task = asyncio.create_task(self._collect_metrics(), name='traffic-samples')
         await self.notifier.notify('SYSTEM', 'OSGate started')
 
+    async def _collect_metrics(self):
+        while True:
+            try:
+                await asyncio.to_thread(self.db.sample_traffic, len(self.socks.active),
+                                        self.settings.traffic_retention_days)
+            except Exception:
+                log.exception('Traffic snapshot error')
+            await asyncio.sleep(60)
+
     async def stop(self):
+        if self._metrics_task:
+            self._metrics_task.cancel()
+            await asyncio.gather(self._metrics_task, return_exceptions=True)
+            self._metrics_task = None
         await self.socks.stop()
         await self.ssh.stop()
         await self.notifier.notify('SYSTEM', 'OSGate stopped')

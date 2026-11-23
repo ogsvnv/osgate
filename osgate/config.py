@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     health_check_timeout: float = Field(default=5, gt=0)
     health_failure_threshold: int = Field(default=3, ge=1)
     health_success_threshold: int = Field(default=2, ge=1)
+    health_dns_enabled: bool = False
+    health_dns_test_host: str = 'example.com'
+    traffic_retention_days: int = Field(default=7, ge=1, le=365)
     health_test_host: str = '1.1.1.1'
     health_test_port: int = Field(default=443, ge=1, le=65535)
     database_url: str = 'sqlite:////data/osgate.db'

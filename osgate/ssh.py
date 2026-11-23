@@ -43,9 +43,10 @@ class State:
     active_channels: int = 0
     task: asyncio.Task | None = None
     changed_at: float = 0
+    verified: bool = False
 
     def ready(self) -> bool:
-        return self.status in ('ONLINE', 'DEGRADED') and self.connection is not None and not self.connection.is_closed()
+        return self.verified and self.status in ('ONLINE', 'DEGRADED') and self.connection is not None and not self.connection.is_closed()
 
 
 class SSHManager:
@@ -97,6 +98,13 @@ class SSHManager:
                 await self._stop_state(state)
             self.states.clear()
 
+    async def reconnect(self, server_id: int):
+        async with self._lock:
+            state = self.states.pop(server_id, None)
+            if state:
+                await self._stop_state(state)
+        await self.refresh()
+
     async def _emit(self, category, message):
         # No secrets: only a server name and generic status, never exceptions with key paths.
         log.warning('%s: %s', category, message)
@@ -117,12 +125,12 @@ class SSHManager:
                     state.reconnect_count += 1
                     conn = await self.connector(state.record, self.settings)
                     state.connection = conn
-                    state.status = 'ONLINE'
+                    state.status = 'CONNECTING'
+                    state.verified = False
                     state.failures = 0
                     state.successes = 0
                     state.last_error = ''
                     state.changed_at = time.monotonic()
-                    await self._emit('SSH', f"{state.record['name']}: ONLINE")
                     delay = self.settings.ssh_reconnect_initial_delay
                     # Periodic real forwarded TCP probes (SSH socket existence alone is insufficient).
                     while not self._stopping and not conn.is_closed():
@@ -133,10 +141,20 @@ class SSHManager:
                                                      self.settings.health_test_port),
                                 timeout=self.settings.health_check_timeout)
                             writer.close()
+                            if self.settings.health_dns_enabled:
+                                # Remote domain is resolved at the SSH exit, not locally.
+                                _, dns_writer = await asyncio.wait_for(
+                                    conn.open_connection(self.settings.health_dns_test_host,
+                                                         self.settings.health_test_port),
+                                    timeout=self.settings.health_check_timeout)
+                                dns_writer.close()
                             state.latency_ms = round((time.monotonic() - begin) * 1000, 1)
                             state.successes += 1
                             state.failures = 0
                             if state.successes >= self.settings.health_success_threshold:
+                                if not state.verified:
+                                    await self._emit('SSH', f"{state.record['name']}: ONLINE")
+                                state.verified = True
                                 state.status = 'ONLINE'
                         except (Exception,) as exc:
                             if isinstance(exc, asyncio.CancelledError):
@@ -144,9 +162,10 @@ class SSHManager:
                             state.failures += 1
                             state.successes = 0
                             state.last_error = type(exc).__name__
-                            state.status = 'DEGRADED'
+                            state.status = 'DEGRADED' if state.verified else 'CONNECTING'
                             if state.failures >= self.settings.health_failure_threshold:
                                 state.status = 'OFFLINE'
+                                state.verified = False
                                 break
                         await asyncio.sleep(self.settings.health_check_interval)
                     if self._stopping:
@@ -159,6 +178,7 @@ class SSHManager:
                     log.warning('SSH %s connection failed: %s', state.record['name'], type(exc).__name__)
                 finally:
                     state.connection = None
+                    state.verified = False
                     state.status = 'OFFLINE'
                     if conn:
                         conn.close()

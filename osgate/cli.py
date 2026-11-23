@@ -77,6 +77,7 @@ def main(argv=None):
                 record.password_hash = hasher.hash(pwd)
             else:
                 s.add(Admin(username=args.username, password_hash=hasher.hash(pwd)))
+        db.revoke_admin_sessions()
         print('Administrator credentials saved')
     elif args.command == 'server' and args.action == 'list':
         for rec in db.servers():

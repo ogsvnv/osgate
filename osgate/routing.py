@@ -1,5 +1,6 @@
 """Deterministic candidate selection. Never uses a local network path."""
 import itertools
+import time
 
 MODES = {'failover', 'round_robin', 'weighted_round_robin', 'manual', 'sticky'}
 
@@ -8,6 +9,9 @@ class Router:
     def __init__(self):
         self._round = itertools.count()
         self._sticky = {}
+        self._selected_failover_id = None
+        self._failover_since = 0.0
+        self.last_failover = None
 
     def candidates(self, servers: list[dict], settings: dict, client: dict) -> list[dict]:
         ready = sorted((x for x in servers if x['ready']),
@@ -23,6 +27,20 @@ class Router:
             return [x for x in ready if x['id'] == settings.get('manual_server_id')]
         if not ready:
             return []
+        if mode == 'failover':
+            chosen = ready[0]
+            if self._selected_failover_id is not None:
+                previous = next((s for s in ready if s['id'] == self._selected_failover_id), None)
+                if previous and previous['id'] != chosen['id']:
+                    elapsed = time.monotonic() - self._failover_since
+                    if not settings.get('auto_failback', True) or elapsed < settings.get('failback_delay', 0):
+                        chosen = previous
+            if self._selected_failover_id != chosen['id']:
+                if self._selected_failover_id is not None:
+                    self.last_failover = time.time()
+                self._selected_failover_id = chosen['id']
+                self._failover_since = time.monotonic()
+            return [chosen] + [s for s in ready if s['id'] != chosen['id']]
         if mode == 'round_robin':
             n = next(self._round) % len(ready)
             return ready[n:] + ready[:n]
