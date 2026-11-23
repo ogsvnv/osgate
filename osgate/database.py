@@ -225,7 +225,9 @@ class Database:
         with self.session() as session:
             rows = list(session.scalars(select(TrafficSample).order_by(
                 TrafficSample.id.desc()).limit(limit)))
-        return [{'time': x.when.isoformat(), 'uploaded': x.bytes_uploaded,
+        return [{'time': (x.when if x.when.tzinfo else
+                          x.when.replace(tzinfo=timezone.utc)).isoformat(),
+                 'uploaded': x.bytes_uploaded,
                  'downloaded': x.bytes_downloaded, 'active': x.active_connections}
                 for x in reversed(rows)]
 
