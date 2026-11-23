@@ -1,7 +1,7 @@
 services:
   osgate:
     build: .
-    image: ghcr.io/ogsvnv/osgate:latest
+    image: ghcr.io/ogsvnv/osgate:0.1.0-alpha
     container_name: osgate
     restart: unless-stopped
     ports:
