@@ -8,7 +8,7 @@ description = "Authenticated SOCKS5 gateway over persistent SSH transports"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
-dependencies = ["asyncssh>=2.17,<3", "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "sqlalchemy>=2.0,<3", "alembic>=1.13,<2", "argon2-cffi>=23,<26", "pydantic-settings>=2.5,<3", "jinja2>=3.1,<4", "python-multipart>=0.0.9,<1", "itsdangerous>=2.2,<3", "httpx>=0.27,<1"]
+dependencies = ["asyncssh>=2.17,<3", "fastapi>=0.115,<1", "uvicorn>=0.30,<1", "sqlalchemy>=2.0,<3", "alembic>=1.13,<2", "argon2-cffi>=23,<26", "pydantic-settings>=2.5,<3", "jinja2>=3.1,<4", "python-multipart>=0.0.9,<1", "itsdangerous>=2.2,<3", "httpx>=0.27,<1", "cryptography>=42,<51"]
 [project.optional-dependencies]
 test = ["pytest>=8", "pytest-asyncio>=0.24", "httpx>=0.27"]
 [project.scripts]

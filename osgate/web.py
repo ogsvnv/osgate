@@ -221,6 +221,45 @@ def register_routes(app, runtime):
         }
         refreshRoutePreview();setInterval(refreshRoutePreview,5000);
         </script>'''
+        body += ('<section><h2>📊 Качество SSH-серверов</h2>'
+                 '<p class="muted">Статистика реальных TCP-проверок через SSH за последние 10 минут. '
+                 'Процент успеха рассчитывается по выполненным проверкам, а не по времени доступности.</p>'
+                 '<table id="ssh-quality-table"><thead><tr><th>Сервер</th><th>Сейчас</th>'
+                 '<th>Мин.</th><th>Средн.</th><th>Макс.</th><th>Успешно</th>'
+                 '<th>Ошибки</th><th>Каналы</th><th>Последний успех</th></tr></thead>'
+                 '<tbody><tr><td colspan="9">Загрузка данных…</td></tr></tbody></table>'
+                 '</section>')
+        body += '''<script>
+        async function refreshSSHStats(){
+          try{
+            const response=await fetch('/api/ssh-stats',{cache:'no-store'});
+            if(!response.ok)return;
+            const payload=await response.json();
+            const tbody=document.querySelector('#ssh-quality-table tbody');
+            tbody.replaceChildren();
+            const rtt=n=>n==null?'—':n.toLocaleString('ru-RU')+' мс';
+            for(const row of payload.servers){
+              const tr=document.createElement('tr');
+              const stamp=row.last_success?new Date(row.last_success).toLocaleString('ru-RU'):'—';
+              const cells=[row.name,rtt(row.current_rtt_ms),rtt(row.min_rtt_ms),
+                rtt(row.avg_rtt_ms),rtt(row.max_rtt_ms),
+                row.success_rate_percent==null?'—':row.success_rate_percent.toLocaleString('ru-RU')+'% ('+row.success+'/'+row.checks+')',
+                row.failures,row.channels,stamp];
+              for(const value of cells){
+                const td=document.createElement('td');td.textContent=value;
+                tr.appendChild(td);
+              }
+              tbody.appendChild(tr);
+            }
+            if(!payload.servers.length){
+              const tr=document.createElement('tr'),td=document.createElement('td');
+              td.colSpan=9;td.textContent='Нет SSH-серверов';tr.appendChild(td);
+              tbody.appendChild(tr);
+            }
+          }catch(_){}
+        }
+        refreshSSHStats();setInterval(refreshSSHStats,5000);
+        </script>'''
         body += '<section><h2>Состояние SSH</h2><table id="ssh-status-table"><tr><th>Имя</th><th>Состояние</th><th>Каналы</th><th>Задержка</th></tr>'
         for s in servers:
             body += f'<tr><td>{safe(s["name"])}</td><td class="status {safe(s["status"])}">{safe(s["status"])}</td><td>{s["active_channels"]}</td><td>{safe(s["latency_ms"])} мс</td></tr>'
@@ -571,6 +610,9 @@ updateDashboard();setInterval(updateDashboard,5000);
                 actor=request.session['admin'],
                 details={'old_mode': before['mode'], 'new_mode': data['mode']})
             socks.route_tracker.reset()
+            await runtime.notifier.notify_event(
+                'route_manual', f'Маршрутизация: {before["mode"]} → {data["mode"]}'
+                + (f', SSH ID {mid}' if mid is not None and data['mode'] == 'manual' else ''))
         await asyncio.to_thread(db.audit, request.session['admin'], 'routing_change', data['mode'])
         return return_to('/routing')
 
@@ -614,8 +656,32 @@ updateDashboard();setInterval(updateDashboard,5000);
                 f'<p>SOCKS5: <code>{safe(config.socks_host)}:{config.socks_port}</code></p>'
                 f'<p>Проверка SSH каждые {config.health_check_interval} с</p>'
                 '<p>Чувствительные параметры не отображаются.</p></section>')
-        body += '<section><a href="/admin/password">Смена пароля администратора</a> · <a href="/settings/runtime">Параметры работы</a> · <a href="/metrics">Графики</a></section>'
+        body += '<section><a href="/admin/password">Смена пароля администратора</a> · <a href="/settings/runtime">Параметры работы</a> · <a href="/settings/telegram">Настройки Telegram</a> · <a href="/metrics">Графики</a></section>'
         return page(request, 'Настройки', body)
+
+    @app.get('/api/ssh-stats')
+    async def api_ssh_stats(request: Request):
+        require_admin(request)
+        stats = await asyncio.to_thread(db.ssh_latency_stats)
+        rows = []
+        for state in ssh.candidates():
+            rtt = stats.get(state['id'], {})
+            rows.append({
+                'id': state['id'], 'name': state['name'],
+                'status': state['status'], 'ready': state['ready'],
+                'current_rtt_ms': state['latency_ms'],
+                'channels': state['active_channels'],
+                'checks': rtt.get('checks', 0),
+                'success': rtt.get('success', 0),
+                'failures': rtt.get('failures', 0),
+                'min_rtt_ms': rtt.get('min_rtt_ms'),
+                'avg_rtt_ms': rtt.get('avg_rtt_ms'),
+                'max_rtt_ms': rtt.get('max_rtt_ms'),
+                'success_rate_percent': rtt.get('success_rate_percent'),
+                'last_success': rtt.get('last_success'),
+            })
+        return JSONResponse({'window_seconds': 600, 'servers': rows},
+                            headers={'Cache-Control': 'no-store'})
 
     @app.get('/api/ssh-latency')
     async def api_ssh_latency(request: Request):
@@ -642,5 +708,7 @@ updateDashboard();setInterval(updateDashboard,5000);
 
     from .web_v1 import register_v1_routes
     register_v1_routes(app, runtime)
+    from .telegram_ui import register_telegram_routes
+    register_telegram_routes(app, runtime)
     from .route_history_ui import register_route_history_routes
     register_route_history_routes(app, runtime)
