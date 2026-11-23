@@ -21,6 +21,7 @@ class Runtime:
         self.db = db or Database(settings.database_url)
         self.notifier = Notifier(settings)
         self.ssh = SSHManager(self.db, settings, notify=self.notifier.notify, connector=connector)
+        self.notifier.bind_ssh(self.ssh, self.db)
         self.socks = SocksServer(self.db, self.ssh, settings, notify=self.notifier.notify_event)
         self._metrics_task = None
         self.started_at = time.monotonic()
